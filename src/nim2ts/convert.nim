@@ -34,7 +34,7 @@ proc toTsType*(n: NimNode): string =
   case n.kind
   of nnkIdent, nnkSym:
     case n.strVal
-    of "string", "char", "cstring":
+    of "string", "char":
       result = "string"
     of "int", "int8", "int16", "int32", "int64",
        "uint", "uint8", "uint16", "uint32", "uint64", "byte",
@@ -57,11 +57,13 @@ proc toTsType*(n: NimNode): string =
     of "Option":
       result = toTsType(n[1]) & " | null"
     of "Table", "OrderedTable":
-      result = "Record<" & toTsType(n[1]) & ", " & toTsType(n[2]) & ">"
+      if n[1].kind notin {nnkIdent, nnkSym} or n[1].strVal != "string":
+        error("nim2ts: table keys must be strings, got " & n[1].repr, n)
+      result = "Record<string, " & toTsType(n[2]) & ">"
     else:
       # A generic custom type like `Page[User]` -> `Page<User>`.
       result = head & "<" & n[1..^1].mapIt(toTsType(it)).join(", ") & ">"
-  of nnkRefTy, nnkPtrTy, nnkDistinctTy:
+  of nnkRefTy, nnkDistinctTy:
     result = toTsType(n[0])
   else:
     error("nim2ts: unsupported type (" & $n.kind & "): " & n.repr, n)
@@ -88,11 +90,22 @@ proc enumMembers*(enumTy: NimNode): seq[tuple[member, value: string]] =
       let member = identName(field)
       result.add (member, member)
 
+proc hasPragma(field: NimNode, name: string): bool =
+  if field.kind == nnkPragmaExpr:
+    for p in field[1]:
+      if p.kind in {nnkIdent, nnkSym} and p.strVal == name:
+        return true
+
 proc fieldsToTs(def: NimNode): seq[string] =
   ## `a, b: int` is one nnkIdentDefs: (a, b, type, default value).
-  let tsType = toTsType(def[^2])
+  let typ = def[^2]
   for field in def[0 ..< ^2]:
-    result.add identName(field) & ": " & tsType
+    if field.hasPragma("omitNone"):
+      if typ.kind != nnkBracketExpr or identName(typ[0]) != "Option":
+        error("nim2ts: {.omitNone.} needs an Option field: " & identName(field), field)
+      result.add identName(field) & "?: " & toTsType(typ[1])
+    else:
+      result.add identName(field) & ": " & toTsType(typ)
 
 proc branchFieldsToTs(body: NimNode): seq[string] =
   case body.kind

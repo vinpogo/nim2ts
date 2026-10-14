@@ -16,6 +16,7 @@ export interface User extends Entity {
   name: string;
   email: string;
   nickname: string | null;
+  bio?: string;
   roles: Role[];
   status: Status;
   tags: Tags;

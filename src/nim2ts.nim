@@ -11,7 +11,9 @@
 ## ```
 
 import std/[macros, tables]
-import nim2ts/convert
+import nim2ts/[convert, wire]
+
+export wire
 
 const nim2tsOut* {.strdefine.} = "types.ts"
   ## Where the generated file is written, relative to the directory the

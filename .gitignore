@@ -1,3 +1,4 @@
 tests/generated.ts
 tests/tconvert
 tests/tgenerate
+tests/twire
