@@ -78,6 +78,20 @@ switch("define", "nim2tsOut=" & thisDir() & "/../frontend/src/api/types.ts")
 **Rule:** any custom type you reference must also be annotated with `{.ts.}`.
 If you forget one, `tsc` on the frontend reports the unknown name.
 
+### Renaming
+
+`{.ts: "Name".}` declares a type under another name in TypeScript, for
+example when the Nim name would shadow a TypeScript global:
+
+```nim
+type Record* {.ts: "DbRecord".} = object
+  id*: int
+```
+
+Every reference to `Record` in other `{.ts.}` types and `{.rpc.}` procs then
+emits `DbRecord`, wherever it is declared. JSON is unaffected, since type
+names are not on the wire. TypeScript names must be unique.
+
 ### Case objects
 
 A case object becomes the intersection of its shared fields and one union per
@@ -135,6 +149,10 @@ echo toJson(user)
   missing key or `null` as `none` either way.
 - A `nil` ref cannot be written, since its TypeScript type has no `null`; use
   `Option` for values that may be missing.
+- Integers must stay within JavaScript's safe range, ±(2^53 − 1): beyond it a
+  `number` silently loses precision. Writing a larger value raises
+  `WireError`, and reading one is rejected; keep bigger ids in a string type.
+  `NaN` and infinities have no JSON form and raise `WireError` too.
 - `fromJson` is strict: missing keys, wrong JSON kinds, unknown enum values,
   integers out of range (`Natural`, `uint8`, …), arrays of the wrong length
   and strings that are not one `char` raise `WireError`. Its `path` names the
@@ -210,9 +228,10 @@ const user = await client.getUser({ id: 1 }); // typed as User
   an unknown name. Whatever the proc raises passes through, so the app decides
   how errors look on the wire, and can declare that shape with `{.ts.}`.
 - `dispatch` expands to a `case` over the procs registered so far in the
-  compilation, so their modules must be imported where it is called. An
-  `{.rpc.}` proc that comes later is a compile error.
-- Procedure names are unique across the program, generic procs and `var`
+  compilation. It reaches them whatever its caller imports, but an `{.rpc.}`
+  proc compiled after it is a compile error.
+- Procedure names are unique across the program (by Nim's identifier rules:
+  `fooBar` and `foo_bar` are the same name), generic procs and `var`
   parameters are not supported, and parameters cannot have defaults (use
   `Option[T]`). With any `{.rpc.}` proc, the names `Procedures`, `Transport`,
   `createClient` and `Client` are taken in the generated file.
@@ -226,14 +245,16 @@ const user = await client.getUser({ id: 1 }); // typed as User
   values with `fieldPairs` and read `{.omitNone.}` with `hasCustomPragma`.
 - `src/nim2ts/convert.nim` turns that AST into TypeScript text. It works on
   syntax only, so it maps type *names*. `toTsType` is where new mappings go.
-- `src/nim2ts.nim` keeps compile-time lists of all declarations, the wire
-  values of every annotated enum (case object branches need them) and the
-  `{.rpc.}` procs. It rewrites the whole output file on every `{.ts.}` and
-  `{.rpc.}`; the last one leaves the complete file behind. Under `nim check`
-  and nimsuggest, `writeFile` is a no-op, so your editor won't touch the file.
+- `src/nim2ts.nim` keeps compile-time lists of all declarations, their
+  TypeScript names, the wire values of every annotated enum (case object
+  branches need them) and the `{.rpc.}` procs. It renders and rewrites the
+  whole output file on every `{.ts.}` and `{.rpc.}`; the last one leaves the
+  complete file behind. Under `nim check` and nimsuggest, `writeFile` is a
+  no-op, so your editor won't touch the file.
 - `proc foo(...) {.rpc.}` is a proc macro pragma. It keeps the proc and adds
-  an exported `nim2tsCallFoo` wrapper that reads the parameters into a
-  hidden object type and writes the result; `dispatch` calls the wrappers.
+  a wrapper that reads the parameters into a hidden object type and writes
+  the result. The wrapper's symbol is stored with `std/macrocache`, and
+  `dispatch` calls those symbols directly.
 
 To see the AST of any Nim snippet, wrap it in `dumpTree:` from `std/macros`.
 

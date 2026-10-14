@@ -13,7 +13,7 @@
 ## Annotate a proc with `{.rpc.}` and the file also gets a typed client for
 ## it, while `dispatch` calls it from JSON on the Nim side.
 
-import std/[json, macros, strutils, tables]
+import std/[json, macrocache, macros, strutils, tables]
 import nim2ts/[convert, wire]
 
 export wire
@@ -33,12 +33,18 @@ type UnknownProcedure* = object of CatchableError
 proc unknownProcedure(name: string): ref UnknownProcedure =
   newException(UnknownProcedure, "nim2ts: unknown procedure " & name)
 
-var tsDecls {.compileTime.}: seq[tuple[name, code: string]]
-  ## Every declaration generated so far in this compilation, across all modules.
+var tsDecls {.compileTime.}: seq[tuple[nimName, tsName: string, typeDef: NimNode]]
+  ## Every `{.ts.}` declaration so far in this compilation, across all
+  ## modules. They are rendered when the file is written, so a reference
+  ## to a renamed type gets its TypeScript name in any declaration order.
 
-var tsEnums {.compileTime.}: EnumValues
+var known {.compileTime.}: Known
 
-var rpcProcs {.compileTime.}: seq[tuple[name, entry: string, hasInput, hasContext: bool]]
+var rpcProcs {.compileTime.}: seq[RpcSignature]
+
+const rpcWrappers = CacheSeq"nim2ts.rpcWrappers"
+  ## `(wrapper symbol, procedure name, takes a context)` per `{.rpc.}` proc,
+  ## for `dispatch`. Symbols reach the wrappers whatever the caller imports.
 
 var dispatched {.compileTime.} = false
   ## A `dispatch` expansion only knows the procedures registered before it.
@@ -50,47 +56,67 @@ proc writeOutput() {.compileTime.} =
   # no-op.)
   var content = header
   for d in tsDecls:
-    content.add "\n" & d.code & "\n"
+    content.add "\n" & toTsDecl(d.typeDef, known) & "\n"
   if rpcProcs.len > 0:
-    var client: seq[tuple[name, entry: string, hasInput: bool]]
-    for p in rpcProcs:
-      client.add (p.name, p.entry, p.hasInput)
-    content.add "\n" & clientToTs(client) & "\n"
+    content.add "\n" & clientToTs(rpcProcs, known) & "\n"
   writeFile(nim2tsOut, content)
 
-macro ts*(typeDef: untyped): untyped =
+proc declare(typeDef: NimNode, tsName: string) {.compileTime.} =
+  let nimName = identName(typeDef[0])
+  if tsName.len == 0 or tsName[0] notin IdentStartChars + {'$'} or
+      not tsName.allCharsInSet(IdentChars + {'$'}):
+    error("nim2ts: '" & tsName & "' is not a TypeScript identifier", typeDef)
+  for d in tsDecls:
+    if eqIdent(d.nimName, nimName):
+      error("nim2ts: a type named '" & nimName &
+        "' is already exported to TypeScript", typeDef)
+    if d.tsName == tsName:
+      error("nim2ts: '" & d.nimName & "' already uses the TypeScript name '" &
+        tsName & "'", typeDef)
+  if rpcProcs.len > 0 and tsName in rpcNames:
+    error("nim2ts: '" & tsName & "' is declared by the RPC client", typeDef)
+  known.names[nimIdentNormalize(nimName)] = tsName
+  if typeDef[2].kind == nnkEnumTy:
+    known.enums[nimIdentNormalize(nimName)] = enumMembers(typeDef[2])
+  tsDecls.add (nimName, tsName, typeDef.copyNimTree)
+  writeOutput()
+
+macro ts*(args: varargs[untyped]): untyped =
   ## Type pragma: `type Foo {.ts.} = ...`. Nim passes us the `nnkTypeDef`,
   ## we record its TypeScript version and hand the type back unchanged.
-  let decl = toTsDecl(typeDef, tsEnums)
-  for existing in tsDecls:
-    if existing.name == decl.name:
-      error("nim2ts: a type named '" & decl.name &
-        "' is already exported to TypeScript", typeDef)
-  if rpcProcs.len > 0 and decl.name in rpcNames:
-    error("nim2ts: '" & decl.name & "' is declared by the RPC client", typeDef)
-  tsDecls.add decl
-  if typeDef[2].kind == nnkEnumTy:
-    tsEnums[decl.name] = enumMembers(typeDef[2])
-  writeOutput()
+  ##
+  ## `type Record {.ts: "DbRecord".} = ...` declares the type under another
+  ## name in TypeScript, and every reference to it uses that name. JSON is
+  ## unaffected: type names are not on the wire.
+  let typeDef = args[^1]
+  case args.len
+  of 1:
+    declare(typeDef, identName(typeDef[0]))
+  of 2:
+    if args[0].kind notin nnkStrLit..nnkTripleStrLit:
+      error("nim2ts: the TypeScript name must be a string literal", args[0])
+    declare(typeDef, args[0].strVal)
+  else:
+    error("nim2ts: {.ts.} takes at most one argument, the TypeScript name", typeDef)
   result = typeDef
 
-proc wrapperName(procedure: string): string =
-  "nim2tsCall" & procedure.capitalizeAscii
+macro registerRpc(wrapper: typed, name: static string, hasContext: static bool) =
+  rpcWrappers.add nnkPar.newTree(wrapper, newLit(name), newLit(hasContext))
 
 macro rpc*(procDef: untyped): untyped =
   ## Proc pragma: `proc getUser*(id: UserId): User {.rpc.}`. Keeps the proc
-  ## and adds an exported wrapper that reads its parameters from a JSON
-  ## object and writes its result, for `dispatch` to call.
+  ## and adds a wrapper that reads its parameters from a JSON object and
+  ## writes its result, for `dispatch` to call.
   let sig = rpcSignature(procDef)
   if dispatched:
     error("nim2ts: '" & sig.name & "' comes after a dispatch call, which " &
       "cannot reach it; import its module before calling dispatch", procDef)
   for existing in rpcProcs:
-    if existing.name == sig.name:
+    if eqIdent(existing.name, sig.name):
       error("nim2ts: an {.rpc.} proc named '" & sig.name & "' already exists", procDef)
   for d in tsDecls:
-    if d.name in rpcNames:
-      error("nim2ts: the RPC client declares '" & d.name &
+    if d.tsName in rpcNames:
+      error("nim2ts: the RPC client declares '" & d.tsName &
         "', which a {.ts.} type already uses", procDef)
 
   let inputType = genSym(nskType, "Input")
@@ -110,7 +136,7 @@ macro rpc*(procDef: untyped): untyped =
       fields.add newIdentDefs(ident(p.name), p.typ.copyNimTree)
       call.add newDotExpr(args, ident(p.name))
 
-  rpcProcs.add (sig.name, procedureToTs(sig), fields.len > 0, hasContext)
+  rpcProcs.add rpcSignature(procDef.copyNimTree)
   writeOutput()
 
   var params = @[bindSym"JsonNode", newIdentDefs(input, bindSym"JsonNode")]
@@ -122,11 +148,13 @@ macro rpc*(procDef: untyped): untyped =
       newStmtList(readArgs, call, newCall(bindSym"newJNull"))
     else:
       newStmtList(readArgs, newCall(bindSym("toJson", brOpen), call))
+  let wrapper = genSym(nskProc, sig.name)
   result = newStmtList(
     procDef,
     nnkTypeSection.newTree(nnkTypeDef.newTree(inputType, newEmptyNode(),
       nnkObjectTy.newTree(newEmptyNode(), newEmptyNode(), fields))),
-    newProc(postfix(ident(wrapperName(sig.name)), "*"), params, body),
+    newProc(wrapper, params, body),
+    newCall(bindSym"registerRpc", wrapper, newLit(sig.name), newLit(hasContext)),
   )
 
 proc dispatchCase(procedure, input, context, unknown: NimNode): NimNode {.compileTime.} =
@@ -138,14 +166,15 @@ proc dispatchCase(procedure, input, context, unknown: NimNode): NimNode {.compil
   if context != nil:
     lets.add newLetStmt(c, context)
   var branches = nnkCaseStmt.newTree(p)
-  for r in rpcProcs:
-    var call = newCall(ident(wrapperName(r.name)), i)
-    if r.hasContext:
+  for entry in rpcWrappers:
+    let name = entry[1].strVal
+    var call = newCall(entry[0], i)
+    if entry[2].boolVal:
       if context == nil:
-        error("nim2ts: '" & r.name & "' takes a {.context.} parameter; " &
+        error("nim2ts: '" & name & "' takes a {.context.} parameter; " &
           "pass a context to dispatch", procedure)
       call.add c
-    branches.add nnkOfBranch.newTree(newLit(r.name), call)
+    branches.add nnkOfBranch.newTree(newLit(name), call)
   branches.add nnkElse.newTree(nnkRaiseStmt.newTree(newCall(unknown, p)))
   result = nnkStmtListExpr.newTree(lets & @[branches])
 
@@ -153,8 +182,8 @@ macro dispatch*(procedure, input: untyped): untyped =
   ## Calls the `{.rpc.}` proc named `procedure` with the parameters in the
   ## JSON object `input` and returns its result as JSON. Raises `WireError`
   ## for invalid input and `UnknownProcedure` for an unknown name; whatever
-  ## the proc raises passes through. It only reaches procs whose modules
-  ## are imported where it is called.
+  ## the proc raises passes through. It reaches every `{.rpc.}` proc
+  ## compiled before it, whatever the caller imports.
   dispatchCase(procedure, input, nil, bindSym"unknownProcedure")
 
 macro dispatch*(procedure, input, context: untyped): untyped =

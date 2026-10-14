@@ -1,7 +1,7 @@
 # Strict JSON in both directions. No `{.ts.}` here: that would rewrite
 # tests/generated.ts, which tgenerate owns.
 
-import std/[json, options, tables, unittest]
+import std/[json, math, options, strutils, tables, unittest]
 import nim2ts/wire
 
 type
@@ -107,3 +107,35 @@ test "reads the branch the discriminator selects":
   check item.radius == 4
   j.delete("radius")
   check rejects($j, "$.radius")
+
+type Wide = object
+  signed: int64
+  unsigned: uint64
+  plain: int
+
+test "integers are limited to JavaScript's safe range":
+  const safe = 9007199254740991'i64
+  let edge = Wide(signed: -safe, unsigned: uint64(safe), plain: int(safe))
+  check toJson(fromJson(toJson(edge), Wide)) == toJson(edge)
+  expect WireError:
+    discard toJson(Wide(signed: safe + 1))
+  expect WireError:
+    discard toJson(Wide(signed: low(int64)))
+  expect WireError:
+    discard toJson(Wide(unsigned: high(uint64)))
+  expect WireError:
+    discard toJson(Wide(plain: high(int)))
+
+  proc rejectsWide(json: string, path: string): bool =
+    try:
+      discard fromJson(parseJson(json), Wide)
+    except WireError as e:
+      return e.path == path and "safe integer range" in e.msg
+  check rejectsWide("""{"signed": 9007199254740992, "unsigned": 0, "plain": 0}""", "$.signed")
+  check rejectsWide("""{"signed": 0, "unsigned": 18446744073709551615, "plain": 0}""", "$.unsigned")
+  check rejectsWide("""{"signed": 0, "unsigned": 0, "plain": -123456789012345678901}""", "$.plain")
+
+test "non-finite floats cannot be written":
+  for x in [NaN, Inf, NegInf]:
+    expect WireError:
+      discard toJson(x)

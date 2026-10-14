@@ -51,11 +51,20 @@ export type Label = LabeledShape & {
   text: string;
 };
 
+export type Owner = {
+  records: DbRecord[];
+};
+
+export type DbRecord = {
+  id: number;
+};
+
 export type Procedures = {
   findUser: { input: { id: UserId }; output: User };
   listUsers: { input: { role?: Role | null }; output: UserPage };
   area: { input: { shape: Shape }; output: number };
   ping: { input: Record<string, never>; output: null };
+  firstRecord: { input: { owner: Owner }; output: DbRecord };
 };
 
 export type Transport = <P extends keyof Procedures>(
@@ -68,6 +77,7 @@ export const createClient = (transport: Transport) => ({
   listUsers: (input: Procedures["listUsers"]["input"]) => transport("listUsers", input),
   area: (input: Procedures["area"]["input"]) => transport("area", input),
   ping: () => transport("ping", {}),
+  firstRecord: (input: Procedures["firstRecord"]["input"]) => transport("firstRecord", input),
 });
 
 export type Client = ReturnType<typeof createClient>;

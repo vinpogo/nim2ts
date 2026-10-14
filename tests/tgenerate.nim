@@ -59,6 +59,12 @@ type
   Label* {.ts.} = ref object of LabeledShape
     text*: string
 
+  Owner* {.ts.} = object
+    records*: seq[Record]
+
+  Record* {.ts: "DbRecord".} = object
+    id*: int
+
 type
   Directory = ref object
     users: seq[User]
@@ -85,6 +91,9 @@ proc area*(shape: Shape): float {.rpc.} =
 
 proc ping*() {.rpc.} =
   discard
+
+proc firstRecord*(owner: Owner): Record {.rpc.} =
+  owner.records[0]
 
 test "generated file matches snapshot":
   let dir = currentSourcePath.parentDir
@@ -120,6 +129,7 @@ test "dispatch reads parameters, passes the context and writes the result":
   check dispatch("listUsers", %*{}, dir)["total"].getInt == 2
   check dispatch("area", %*{"shape": {"name": "r", "kind": "RECT", "width": 2, "height": 3}}, dir).getFloat == 6
   check dispatch("ping", %*{}, dir).kind == JNull
+  check dispatch("firstRecord", %*{"owner": {"records": [{"id": 4}]}}, dir) == %*{"id": 4}
 
 test "dispatch rejects unknown procedures and invalid input":
   expect UnknownProcedure:

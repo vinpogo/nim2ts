@@ -5,7 +5,7 @@
 ## strict: it rejects anything the TypeScript type would not allow and
 ## anything that does not fit the Nim type (out of range, wrong length).
 
-import std/[json, macros, options, tables, typetraits]
+import std/[json, macros, math, options, strutils, tables, typetraits]
 
 template omitNone*() {.pragma.}
   ## Field pragma for `Option[T]`: `none` leaves the key out instead of
@@ -13,6 +13,13 @@ template omitNone*() {.pragma.}
 
 type WireError* = object of ValueError
   path*: string ## where in the document, as `$.items[2].name`
+
+const maxSafeInteger = 9007199254740991'i64
+  ## `Number.MAX_SAFE_INTEGER`: TypeScript's `number` holds integers exactly
+  ## up to here, so values beyond it are refused in both directions.
+
+proc unsafeInteger(value: string): string =
+  value & " exceeds JavaScript's safe integer range (±" & $maxSafeInteger & ")"
 
 proc fail(path, msg: string) {.noreturn.} =
   var e = newException(WireError, "nim2ts: " & msg & " at " & path)
@@ -40,8 +47,19 @@ proc expect(n: JsonNode, kinds: set[JsonNodeKind], what, path: string) =
 proc toJson*(x: string): JsonNode = newJString(x)
 proc toJson*(x: char): JsonNode = newJString($x)
 proc toJson*(x: bool): JsonNode = newJBool(x)
-proc toJson*(x: SomeInteger): JsonNode = newJInt(BiggestInt(x))
-proc toJson*(x: SomeFloat): JsonNode = newJFloat(float(x))
+proc toJson*(x: SomeInteger): JsonNode =
+  when sizeof(x) >= 8:
+    let unsafe =
+      when x is SomeUnsignedInt: x > uint64(maxSafeInteger)
+      else: x > maxSafeInteger or x < -maxSafeInteger
+    if unsafe:
+      raise newException(WireError, "nim2ts: " & unsafeInteger($x))
+  newJInt(BiggestInt(x))
+
+proc toJson*(x: SomeFloat): JsonNode =
+  if classify(x) in {fcNan, fcInf, fcNegInf}:
+    raise newException(WireError, "nim2ts: " & $x & " has no JSON form")
+  newJFloat(float(x))
 proc toJson*(x: enum): JsonNode = newJString($x)
 
 proc toJson*(x: JsonNode): JsonNode =
@@ -117,8 +135,14 @@ proc readJson(dst: var bool, n: JsonNode, path: string) =
   dst = n.bval
 
 proc readJson[T: SomeInteger](dst: var T, n: JsonNode, path: string) =
+  # std/json keeps an integer too large for int64 as a string of digits.
+  if not n.isNil and n.kind == JString and n.str.len >= 19 and
+      n.str.strip(trailing = false, chars = {'-'}).allCharsInSet(Digits):
+    fail(path, unsafeInteger(n.str))
   expect(n, {JInt}, "an integer", path)
   let v = n.num
+  if v > maxSafeInteger or v < -maxSafeInteger:
+    fail(path, unsafeInteger($v))
   when T is SomeUnsignedInt and sizeof(T) >= sizeof(BiggestInt):
     if v < 0:
       fail(path, $v & " is out of range for " & $T)
