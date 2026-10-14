@@ -13,7 +13,7 @@
 ## Annotate a proc with `{.rpc.}` and the file also gets a typed client for
 ## it, while `dispatch` calls it from JSON on the Nim side.
 
-import std/[json, macrocache, macros, strutils, tables]
+import std/[json, macrocache, macros, sequtils, sets, strutils, tables]
 import nim2ts/[convert, wire]
 
 export wire
@@ -33,14 +33,17 @@ type UnknownProcedure* = object of CatchableError
 proc unknownProcedure(name: string): ref UnknownProcedure =
   newException(UnknownProcedure, "nim2ts: unknown procedure " & name)
 
-var tsDecls {.compileTime.}: seq[tuple[nimName, tsName: string, typeDef: NimNode]]
+var tsDecls {.compileTime.}: seq[tuple[nimName, tsName: string, typeDef: NimNode,
+    code: string, refs: HashSet[string]]]
   ## Every `{.ts.}` declaration so far in this compilation, across all
-  ## modules. They are rendered when the file is written, so a reference
-  ## to a renamed type gets its TypeScript name in any declaration order.
+  ## modules, with its TypeScript and the names it mentions. Declaring a
+  ## type re-renders what mentions it, so a reference gets the type's
+  ## TypeScript name in any declaration order.
 
 var known {.compileTime.}: Known
 
-var rpcProcs {.compileTime.}: seq[RpcSignature]
+var rpcProcs {.compileTime.}: seq[tuple[sig: RpcSignature, entry: string,
+    refs: HashSet[string]]]
 
 const rpcWrappers = CacheSeq"nim2ts.rpcWrappers"
   ## `(wrapper symbol, procedure name, takes a context)` per `{.rpc.}` proc,
@@ -56,9 +59,9 @@ proc writeOutput() {.compileTime.} =
   # no-op.)
   var content = header
   for d in tsDecls:
-    content.add "\n" & toTsDecl(d.typeDef, known) & "\n"
+    content.add "\n" & d.code & "\n"
   if rpcProcs.len > 0:
-    content.add "\n" & clientToTs(rpcProcs, known) & "\n"
+    content.add "\n" & clientToTs(rpcProcs.mapIt((it.sig.name, it.entry, it.sig.hasInput))) & "\n"
   writeFile(nim2tsOut, content)
 
 proc declare(typeDef: NimNode, tsName: string) {.compileTime.} =
@@ -66,6 +69,9 @@ proc declare(typeDef: NimNode, tsName: string) {.compileTime.} =
   if tsName.len == 0 or tsName[0] notin IdentStartChars + {'$'} or
       not tsName.allCharsInSet(IdentChars + {'$'}):
     error("nim2ts: '" & tsName & "' is not a TypeScript identifier", typeDef)
+  if isMapped(nimName, generic = typeDef[1].kind == nnkGenericParams):
+    error("nim2ts: '" & nimName & "' is a type nim2ts maps itself; " &
+      "give yours another Nim name", typeDef)
   for d in tsDecls:
     if eqIdent(d.nimName, nimName):
       error("nim2ts: a type named '" & nimName &
@@ -75,10 +81,18 @@ proc declare(typeDef: NimNode, tsName: string) {.compileTime.} =
         tsName & "'", typeDef)
   if rpcProcs.len > 0 and tsName in rpcNames:
     error("nim2ts: '" & tsName & "' is declared by the RPC client", typeDef)
-  known.names[nimIdentNormalize(nimName)] = tsName
+  let key = nimIdentNormalize(nimName)
+  known.names[key] = tsName
   if typeDef[2].kind == nnkEnumTy:
-    known.enums[nimIdentNormalize(nimName)] = enumMembers(typeDef[2])
-  tsDecls.add (nimName, tsName, typeDef.copyNimTree)
+    known.enums[key] = enumMembers(typeDef[2])
+  for d in tsDecls.mitems:
+    if key in d.refs:
+      d.code = toTsDecl(d.typeDef, known)
+  for p in rpcProcs.mitems:
+    if key in p.refs:
+      p.entry = procedureToTs(p.sig, known)
+  let node = typeDef.copyNimTree
+  tsDecls.add (nimName, tsName, node, toTsDecl(node, known), referencedNames(node))
   writeOutput()
 
 macro ts*(args: varargs[untyped]): untyped =
@@ -112,7 +126,7 @@ macro rpc*(procDef: untyped): untyped =
     error("nim2ts: '" & sig.name & "' comes after a dispatch call, which " &
       "cannot reach it; import its module before calling dispatch", procDef)
   for existing in rpcProcs:
-    if eqIdent(existing.name, sig.name):
+    if eqIdent(existing.sig.name, sig.name):
       error("nim2ts: an {.rpc.} proc named '" & sig.name & "' already exists", procDef)
   for d in tsDecls:
     if d.tsName in rpcNames:
@@ -136,7 +150,12 @@ macro rpc*(procDef: untyped): untyped =
       fields.add newIdentDefs(ident(p.name), p.typ.copyNimTree)
       call.add newDotExpr(args, ident(p.name))
 
-  rpcProcs.add rpcSignature(procDef.copyNimTree)
+  let stored = rpcSignature(procDef.copyNimTree)
+  var refs: HashSet[string]
+  for p in stored.params:
+    refs.incl referencedNames(p.typ)
+  refs.incl referencedNames(stored.returnType)
+  rpcProcs.add (stored, procedureToTs(stored, known), refs)
   writeOutput()
 
   var params = @[bindSym"JsonNode", newIdentDefs(input, bindSym"JsonNode")]

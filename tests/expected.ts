@@ -59,12 +59,55 @@ export type DbRecord = {
   id: number;
 };
 
+export type Result<T> = (
+  | { ok: true; value: T }
+  | { ok: false; error: string }
+);
+
+export type Severity = "info" | "CRITICAL";
+
+export type Alert = {
+  message: string;
+} & (
+  | { level: "info" }
+  | { level: "CRITICAL"; pager?: string; escalatedBy: UserId }
+);
+
+export type Box<Record> = {
+  item: Record;
+};
+
+export type PageOf<T> = {
+  items: T[];
+  next?: T;
+};
+
+export type HasName = {
+  name: string;
+};
+
+export type Pet = HasName & {
+  species: string;
+  records: Record<string, DbRecord>;
+};
+
+export type Versioned<T> = {
+  version: number;
+  data: T;
+  comment?: T;
+};
+
+export type Note = Versioned<string> & {
+  title: string;
+};
+
 export type Procedures = {
   findUser: { input: { id: UserId }; output: User };
   listUsers: { input: { role?: Role | null }; output: UserPage };
   area: { input: { shape: Shape }; output: number };
   ping: { input: Record<string, never>; output: null };
   firstRecord: { input: { owner: Owner }; output: DbRecord };
+  nextPage: { input: { page: PageOf<DbRecord> }; output: Result<PageOf<DbRecord>> };
 };
 
 export type Transport = <P extends keyof Procedures>(
@@ -78,6 +121,7 @@ export const createClient = (transport: Transport) => ({
   area: (input: Procedures["area"]["input"]) => transport("area", input),
   ping: () => transport("ping", {}),
   firstRecord: (input: Procedures["firstRecord"]["input"]) => transport("firstRecord", input),
+  nextPage: (input: Procedures["nextPage"]["input"]) => transport("nextPage", input),
 });
 
 export type Client = ReturnType<typeof createClient>;
