@@ -28,12 +28,12 @@ Every `nim c` writes:
 
 export type Role = "admin" | "member";
 
-export interface User {
+export type User = {
   id: number;
   name: string;
   email: string | null;
   roles: Role[];
-}
+};
 ```
 
 ### Output path
@@ -64,8 +64,8 @@ switch("define", "nim2tsOut=" & thisDir() & "/../frontend/src/api/types.ts")
 | `Option[T]` field with `{.omitNone.}`          | optional field `?: T` |
 | `Table[string, V]`, `OrderedTable[string, V]`  | `Record<string, V>` |
 | `ref T`, `distinct T`                          | `T`                 |
-| `object` / `ref object`                        | `interface`         |
-| `object of Base`                               | `interface … extends Base` |
+| `object` / `ref object`                        | object type `{ … }` |
+| `object of Base`                               | `type … = Base & { … }` |
 | `enum`                                         | union of string literals (uses explicit string values if given) |
 | case object (`case kind: K`)                   | discriminated union (see below) |
 | `Foo[T]` (generic)                             | `Foo<T>`            |
@@ -107,7 +107,9 @@ export type Shape = {
 ```
 
 The discriminator must be a `bool` or an enum annotated with `{.ts.}` and
-declared before the case object, so its wire values are known. Branch labels
+declared before the case object, so its wire values are known. Two members of
+an annotated enum cannot share a string value: the wire could not tell them
+apart. Branch labels
 must be plain members (no ranges), and nested `case` sections are not
 supported yet.
 

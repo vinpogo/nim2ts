@@ -74,21 +74,29 @@ type EnumValues* = Table[string, seq[tuple[member, value: string]]]
 
 proc enumMembers*(enumTy: NimNode): seq[tuple[member, value: string]] =
   ## The members of an `nnkEnumTy` and the strings `$` gives for them,
-  ## which is how `std/json` and jsony serialize enums.
+  ## which is how `std/json` and jsony serialize enums. Two members with
+  ## the same string could not be told apart on the wire, so they are an
+  ## error.
   for field in enumTy[1..^1]: # enumTy[0] is always empty
+    var member, value: string
     if field.kind == nnkEnumFieldDef:
-      let member = identName(field[0])
+      member = identName(field[0])
       let explicit = field[1]
       case explicit.kind
       of nnkStrLit..nnkTripleStrLit:
-        result.add (member, explicit.strVal) # `active = "ACTIVE"`
+        value = explicit.strVal # `active = "ACTIVE"`
       of nnkTupleConstr, nnkPar:
-        result.add (member, explicit[1].strVal) # `active = (1, "ACTIVE")`
+        value = explicit[1].strVal # `active = (1, "ACTIVE")`
       else:
-        result.add (member, member) # `active = 1`: `$` still gives the name
+        value = member # `active = 1`: `$` still gives the name
     else:
-      let member = identName(field)
-      result.add (member, member)
+      member = identName(field)
+      value = member
+    for seen in result:
+      if seen.value == value:
+        error("nim2ts: enum members '" & seen.member & "' and '" & member &
+          "' share the wire value \"" & value & "\"", field)
+    result.add (member, value)
 
 proc hasPragma(field: NimNode, name: string): bool =
   if field.kind == nnkPragmaExpr:
@@ -169,9 +177,9 @@ proc caseToTs(recCase: NimNode, enums: EnumValues): string =
   result = "(\n" & branches.join("\n") & "\n)"
 
 proc objectToTs(name, generics: string, objTy: NimNode, enums: EnumValues): string =
-  ## `objTy` is an `nnkObjectTy`: (pragmas, inheritance, fields). A plain
-  ## object becomes an interface; one with `case` sections an intersection
-  ## of its shared fields and one union per section.
+  ## `objTy` is an `nnkObjectTy`: (pragmas, inheritance, fields). The
+  ## result is the intersection of its base, its shared fields and one
+  ## union per `case` section.
   var base = ""
   let inherit = objTy[1]
   if inherit.kind == nnkOfInherit and identName(inherit[0]) != "RootObj":
@@ -190,23 +198,15 @@ proc objectToTs(name, generics: string, objTy: NimNode, enums: EnumValues): stri
       else:
         error("nim2ts: unsupported object field (" & $def.kind & ")", def)
 
-  let body =
-    if fields.len == 0: "{}"
-    else: "{\n" & fields.mapIt("  " & it & ";").join("\n") & "\n}"
-
-  if unions.len == 0:
-    result = "export interface " & name & generics
-    if base.len > 0:
-      result.add " extends " & base
-    result.add " " & body
-  else:
-    var parts: seq[string]
-    if base.len > 0:
-      parts.add base
-    if fields.len > 0:
-      parts.add body
-    parts.add unions
-    result = "export type " & name & generics & " = " & parts.join(" & ") & ";"
+  var parts: seq[string]
+  if base.len > 0:
+    parts.add base
+  if fields.len > 0:
+    parts.add "{\n" & fields.mapIt("  " & it & ";").join("\n") & "\n}"
+  parts.add unions
+  if parts.len == 0:
+    parts.add "{}"
+  result = "export type " & name & generics & " = " & parts.join(" & ") & ";"
 
 proc enumToTs(name: string, enumTy: NimNode): string =
   ## Enums become a union of string literals.
