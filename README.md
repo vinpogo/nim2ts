@@ -92,6 +92,13 @@ Every reference to `Record` in other `{.ts.}` types and `{.rpc.}` procs then
 emits `DbRecord`, wherever it is declared. JSON is unaffected, since type
 names are not on the wire. TypeScript names must be unique.
 
+Names follow Nim's identifier rules (`Json_node` is `JsonNode`). A `{.ts.}`
+type cannot take a scalar name from the table above, and a generic one not a
+container name either, since `Table[K, V]` would read as the table. A
+generic parameter cannot hide a type it refers to: in `Box[DbRecord]`, a
+field of type `Record` is a compile error, as TypeScript would read
+`DbRecord` as the parameter.
+
 ### Case objects
 
 A case object becomes the intersection of its shared fields and one union per
@@ -242,7 +249,8 @@ const user = await client.getUser({ id: 1 }); // typed as User
   with the untyped `nnkTypeDef` AST and uses whatever it returns (here, the
   unchanged type).
 - `src/nim2ts/wire.nim` is the JSON side: generic procs that walk the typed
-  values with `fieldPairs` and read `{.omitNone.}` with `hasCustomPragma`.
+  values with `fieldPairs` and find `{.omitNone.}` in the type's declaration,
+  through inherited fields too.
 - `src/nim2ts/convert.nim` turns that AST into TypeScript text. It works on
   syntax only, so it maps type *names*. `toTsType` is where new mappings go.
 - `src/nim2ts.nim` keeps compile-time lists of all declarations, their
@@ -264,8 +272,19 @@ To see the AST of any Nim snippet, wrap it in `dumpTree:` from `std/macros`.
 nimble test
 ```
 
-`tests/tconvert.nim` unit-tests the mapping at compile time;
-`tests/tgenerate.nim` compares the generated file to `tests/expected.ts`,
-round-trips its types through JSON and calls its procs through `dispatch`;
-`tests/twire.nim` tests the JSON rules; `tests/tcompile.nim` checks the
-compile errors in `tests/fixtures/`.
+- `tests/tconvert.nim` unit-tests the mapping at compile time.
+- `tests/tgenerate.nim` compares the generated file to `tests/expected.ts`.
+  The files in `tests/json/` are values of those types, written by hand from
+  the TypeScript type each is named after: `toJson` must write exactly that
+  and `fromJson` read it back. The files in `tests/rpc/` are calls of its
+  `{.rpc.}` procs, which `dispatch` must answer with the expected output. Its
+  types include deliberate combinations of features, so a new feature should
+  get one there too, with JSON files for it.
+- `tests/twire.nim` tests the JSON rules.
+- `tests/tcompile.nim` checks behavior across modules and the compile
+  errors in `tests/fixtures/`.
+
+When the TypeScript changes on purpose, review the diff and copy
+`tests/generated.ts` over `tests/expected.ts`, then update the JSON files
+the change affects.
+CI runs the same on every pull request.

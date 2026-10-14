@@ -1,7 +1,7 @@
 # Unit tests for the AST -> TypeScript mapping. They run at compile time,
 # because NimNodes only exist there: if this file compiles, the tests pass.
 
-import std/[macros, tables]
+import std/[macros, strutils, tables]
 import nim2ts/convert
 
 static:
@@ -117,7 +117,9 @@ static:
     "touch: { input: Record<string, never>; output: null };"
 
   proc sig(src: string): RpcSignature = rpcSignature(parseStmt(src)[0])
-  doAssert clientToTs(@[sig("proc getUser(id: int): User = discard"), sig("proc ping() = discard")]) ==
+  proc entry(sig: RpcSignature): auto = (sig.name, procedureToTs(sig), sig.hasInput)
+  doAssert clientToTs(@[entry(sig("proc getUser(id: int): User = discard")),
+    entry(sig("proc ping() = discard"))]) ==
     """export type Procedures = {
   getUser: { input: { id: number }; output: User };
   ping: { input: Record<string, never>; output: null };
@@ -157,3 +159,51 @@ static:
   doAssert procedureToTs(rpcSignature(parseStmt(
     "proc get(id: int): Record = discard")[0]), renamed) ==
     "get: { input: { id: number }; output: DbRecord };"
+  doAssert toTsDecl(parseStmt("type Page*[Record] = object\n  items: seq[Record]")[0][0], renamed) ==
+    "export type Paged<Record> = {\n  items: Record[];\n};"
+
+# `mappedNames` must list exactly what `toTsType` maps itself: those names
+# ignore the rename table, any other name goes through it.
+static:
+  var everything: Known
+  for name in @mappedNames & "User":
+    everything.names[nimIdentNormalize(name)] = "Renamed"
+  for name in mappedNames:
+    let ts =
+      case name
+      of "seq", "array", "Option": toTsType(parseExpr(name & "[int]"), everything)
+      of "Table", "OrderedTable": toTsType(parseExpr(name & "[string, int]"), everything)
+      else: toTsType(ident(name), everything)
+    doAssert "Renamed" notin ts, name
+  doAssert toTsType(ident("User"), everything) == "Renamed"
+
+# Built-in names follow Nim's identifier rules, and generic parameters hide
+# built-ins and renamed types alike.
+static:
+  doAssert toTsType(parseExpr("Json_node")) == "unknown"
+  doAssert toTsType(parseExpr("float_64")) == "number"
+  doAssert toTsType(parseExpr("seq[Option[str_ing]]")) == "(string | null)[]"
+  doAssert toTsType(parseExpr("Ordered_table[string, int]")) == "Record<string, number>"
+  doAssert toTsDecl(parseStmt("type P = object\n  a {.omit_none.}: Option[int]")[0][0]) ==
+    "export type P = {\n  a?: number;\n};"
+  doAssert toTsDecl(parseStmt("type Wrap*[Natural] = object\n  x: Natural\n  y: seq[Natural]")[0][0]) ==
+    "export type Wrap<Natural> = {\n  x: Natural;\n  y: Natural[];\n};"
+  doAssert toTsDecl(parseStmt("type Opt*[T] = object\n  x: Option[T]")[0][0]) ==
+    "export type Opt<T> = {\n  x: T | null;\n};"
+
+macro declaration(src: static string, names: static seq[(string, string)]) =
+  discard toTsDecl(parseStmt(src)[0][0], Known(names: names.toTable))
+
+static: doAssert compiles(declaration("type Box[T] = object\n  item: Record",
+  @[("Record", "DbRecord")]))
+static: doAssert compiles(declaration("type Box[DbRecord] = object\n  x: int",
+  @[("Record", "DbRecord")]))
+static: doAssert not compiles(declaration("type Box[DbRecord] = object\n  item: Record",
+  @[("Record", "DbRecord")]))
+static: doAssert not compiles(declaration("type Box[DbRecord] = object\n  item: seq[Record]",
+  @[("Record", "DbRecord")]))
+
+# A generic base type.
+static:
+  doAssert toTsDecl(parseStmt("type Child*[T] = object of Base[T]\n  extra: string")[0][0]) ==
+    "export type Child<T> = Base<T> & {\n  extra: string;\n};"

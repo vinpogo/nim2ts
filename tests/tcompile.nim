@@ -10,6 +10,16 @@ proc compiler(command, fixture: string): tuple[output: string, exitCode: int] =
     quoteShell(dir / ".." / "src") & " -d:nim2tsOut=" & quoteShell(getTempDir() / "nim2ts-fixture.ts") &
     " " & quoteShell(dir / "fixtures" / fixture))
 
+proc generate(fixture: string): string =
+  ## The TypeScript a fixture generates, or its compile error.
+  let output = getTempDir() / "nim2ts-" & fixture.changeFileExt(".ts")
+  let (log, code) = execCmdEx(getCurrentCompilerExe() & " c --compileOnly --hints:off --path:" &
+    quoteShell(dir / ".." / "src") & " -d:nim2tsOut=" & quoteShell(output) & " " &
+    quoteShell(dir / "fixtures" / fixture))
+  if code != 0:
+    return log
+  readFile(output)
+
 proc checkError(fixture: string): string =
   let (output, code) = compiler("check", fixture)
   if code == 0:
@@ -38,3 +48,19 @@ test "two {.ts.} types with the same TypeScript name":
 
 test "a TypeScript name that is not an identifier":
   check "'user-account' is not a TypeScript identifier" in checkError("bad_ts_name.nim")
+
+test "a {.ts.} type named like a scalar nim2ts maps itself":
+  check "'Natural' is a type nim2ts maps itself" in checkError("mapped_name.nim")
+
+test "a generic {.ts.} type named like a container nim2ts maps itself":
+  check "'Table' is a type nim2ts maps itself" in checkError("mapped_container.nim")
+
+test "a parameter may share a TypeScript name the declaration does not use":
+  check "export type Box<DbRecord> = {\n  x: number;\n};" in generate("unrelated_parameter.nim")
+
+test "a parameter that hides a type renamed after it":
+  check "'Record' is the TypeScript type 'DbRecord', which the generic parameter 'DbRecord' hides here" in
+    checkError("hidden_by_parameter.nim")
+
+test "a plain type may take a container's name":
+  check "tables: DbTable[];" in generate("container_name.nim")

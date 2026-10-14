@@ -6,7 +6,7 @@
 ## Tip: to see what AST a piece of Nim code produces, run
 ## `dumpTree: <your code>` from `std/macros`.
 
-import std/[macros, sequtils, strutils, tables]
+import std/[macros, sequtils, sets, strutils, tables]
 
 proc identName*(n: NimNode): string =
   ## Returns the plain name of a type or field, stripping the export marker
@@ -33,6 +33,7 @@ type
     ## `nimIdentNormalize` of the Nim type name.
     enums*: EnumValues ## case objects label their branches with these
     names*: Table[string, string] ## the TypeScript name of each type
+    generics*: seq[string] ## the generic parameters in scope, which hide all else
 
 proc tsName*(known: Known, nimName: string): string =
   known.names.getOrDefault(nimIdentNormalize(nimName), nimName)
@@ -41,41 +42,88 @@ proc wrapUnion(tsType: string): string =
   ## `number | null` must become `(number | null)` before appending `[]`.
   if " | " in tsType: "(" & tsType & ")" else: tsType
 
+const
+  scalarTypes = [
+    ("string", "string"), ("char", "string"),
+    ("int", "number"), ("int8", "number"), ("int16", "number"), ("int32", "number"),
+    ("int64", "number"), ("uint", "number"), ("uint8", "number"), ("uint16", "number"),
+    ("uint32", "number"), ("uint64", "number"), ("byte", "number"),
+    ("float", "number"), ("float32", "number"), ("float64", "number"),
+    ("Natural", "number"), ("Positive", "number"),
+    ("bool", "boolean"), ("JsonNode", "unknown"),
+  ]
+  containerTypes = ["seq", "array", "Option", "Table", "OrderedTable"]
+
+const mappedNames* = scalarTypes.mapIt(it[0]) & @containerTypes
+  ## Names `toTsType` maps itself, so a `{.ts.}` type cannot take them.
+
+const builtins = block:
+  ## Every built-in name by `nimIdentNormalize`, which is how Nim compares
+  ## identifiers: its usual spelling, and its TypeScript type if it is a scalar.
+  var table: Table[string, tuple[name, ts: string]]
+  for (nim, ts) in scalarTypes:
+    table[nimIdentNormalize(nim)] = (nim, ts)
+  for name in @containerTypes & @["void", "RootObj"]:
+    table[nimIdentNormalize(name)] = (name, "")
+  table
+
+proc canonical(name: string): string =
+  ## A built-in name in its usual spelling, however it is written.
+  builtins.getOrDefault(nimIdentNormalize(name), (name, "")).name
+
+proc isMapped*(name: string, generic: bool): bool =
+  ## Whether a type named `name` would be mistaken for one `toTsType` maps
+  ## itself: scalars always, containers only as generics, since they are
+  ## mapped in bracket form only.
+  let builtin = canonical(name)
+  builtin in mappedNames and (generic or builtin notin containerTypes)
+
+proc referencedNames*(n: NimNode): HashSet[string] =
+  ## Every identifier in `n`, by `nimIdentNormalize`: more than the types it
+  ## refers to, which only costs a needless re-render.
+  if n.kind in {nnkIdent, nnkSym}:
+    result.incl nimIdentNormalize(n.strVal)
+  for child in n:
+    result.incl referencedNames(child)
+
+proc resolve(name: string, known: Known, n: NimNode): string =
+  ## The TypeScript name of a referenced type, which a generic parameter of
+  ## the same name would capture.
+  result = known.tsName(name)
+  for param in known.generics:
+    if result == param:
+      error("nim2ts: '" & name & "' is the TypeScript type '" & result &
+        "', which the generic parameter '" & param & "' hides here", n)
+
 proc toTsType*(n: NimNode, known = default(Known)): string =
   ## Maps a Nim type expression to a TypeScript type expression.
   ## This is the place to add new mappings.
   case n.kind
   of nnkIdent, nnkSym:
-    case n.strVal
-    of "string", "char":
-      result = "string"
-    of "int", "int8", "int16", "int32", "int64",
-       "uint", "uint8", "uint16", "uint32", "uint64", "byte",
-       "float", "float32", "float64", "Natural", "Positive":
-      result = "number"
-    of "bool":
-      result = "boolean"
-    of "JsonNode":
-      result = "unknown"
-    else:
-      # A custom type: emitted by its TypeScript name. It must also be
-      # annotated with `{.ts.}`, otherwise tsc reports an unknown type.
-      result = known.tsName(n.strVal)
+    for param in known.generics:
+      if eqIdent(n.strVal, param):
+        return param
+    let scalar = builtins.getOrDefault(nimIdentNormalize(n.strVal)).ts
+    if scalar.len > 0:
+      return scalar
+    # A custom type: emitted by its TypeScript name. It must also be
+    # annotated with `{.ts.}`, otherwise tsc reports an unknown type.
+    result = resolve(n.strVal, known, n)
   of nnkBracketExpr:
     let head = identName(n[0])
-    case head
+    case canonical(head)
     of "seq", "array":
       # `array[3, T]` carries the element type last.
       result = wrapUnion(toTsType(n[^1], known)) & "[]"
     of "Option":
       result = toTsType(n[1], known) & " | null"
     of "Table", "OrderedTable":
-      if n[1].kind notin {nnkIdent, nnkSym} or n[1].strVal != "string":
+      if n[1].kind notin {nnkIdent, nnkSym} or canonical(n[1].strVal) != "string":
         error("nim2ts: table keys must be strings, got " & n[1].repr, n)
       result = "Record<string, " & toTsType(n[2], known) & ">"
     else:
       # A generic custom type like `Page[User]` -> `Page<User>`.
-      result = known.tsName(head) & "<" &
+      result = resolve(head, known, n) & "<" &
         n[1..^1].mapIt(toTsType(it, known)).join(", ") & ">"
   of nnkRefTy, nnkDistinctTy:
     result = toTsType(n[0], known)
@@ -111,7 +159,7 @@ proc enumMembers*(enumTy: NimNode): seq[tuple[member, value: string]] =
 proc hasPragma(field: NimNode, name: string): bool =
   if field.kind == nnkPragmaExpr:
     for p in field[1]:
-      if p.kind in {nnkIdent, nnkSym} and p.strVal == name:
+      if p.kind in {nnkIdent, nnkSym} and eqIdent(p.strVal, name):
         return true
 
 proc fieldsToTs(def: NimNode, known: Known): seq[string] =
@@ -119,7 +167,7 @@ proc fieldsToTs(def: NimNode, known: Known): seq[string] =
   let typ = def[^2]
   for field in def[0 ..< ^2]:
     if field.hasPragma("omitNone"):
-      if typ.kind != nnkBracketExpr or identName(typ[0]) != "Option":
+      if typ.kind != nnkBracketExpr or canonical(identName(typ[0])) != "Option":
         error("nim2ts: {.omitNone.} needs an Option field: " & identName(field), field)
       result.add identName(field) & "?: " & toTsType(typ[1], known)
     else:
@@ -146,7 +194,7 @@ proc caseToTs(recCase: NimNode, known: Known): string =
   let tag = identName(discriminator[0])
   let tagType = identName(discriminator[1])
   var values: seq[tuple[member, value: string]]
-  if tagType == "bool":
+  if canonical(tagType) == "bool":
     values = @[("false", "false"), ("true", "true")]
   elif nimIdentNormalize(tagType) in known.enums:
     for (member, value) in known.enums[nimIdentNormalize(tagType)]:
@@ -192,7 +240,8 @@ proc objectToTs(name, generics: string, objTy: NimNode, known: Known): string =
   ## union per `case` section.
   var base = ""
   let inherit = objTy[1]
-  if inherit.kind == nnkOfInherit and identName(inherit[0]) != "RootObj":
+  if inherit.kind == nnkOfInherit and not (inherit[0].kind in {nnkIdent, nnkSym} and
+      canonical(inherit[0].strVal) == "RootObj"):
     base = toTsType(inherit[0], known)
 
   var fields: seq[string]
@@ -223,22 +272,22 @@ proc enumToTs(name: string, enumTy: NimNode): string =
   let members = enumMembers(enumTy).mapIt("\"" & it.value & "\"")
   result = "export type " & name & " = " & members.join(" | ") & ";"
 
-proc genericParams(n: NimNode): string =
-  ## `[T, U: SomeNumber]` -> `<T, U>`
-  if n.kind != nnkGenericParams:
-    return ""
-  var names: seq[string]
-  for def in n:
-    for param in def[0 ..< ^2]:
-      names.add identName(param)
-  result = "<" & names.join(", ") & ">"
+proc genericNames(n: NimNode): seq[string] =
+  ## `[T, U: SomeNumber]` -> `@["T", "U"]`
+  if n.kind == nnkGenericParams:
+    for def in n:
+      for param in def[0 ..< ^2]:
+        result.add identName(param)
 
 proc toTsDecl*(typeDef: NimNode, known = default(Known)): string =
   ## Turns one `nnkTypeDef` (name, generic params, definition) into a
   ## complete TypeScript declaration.
   typeDef.expectKind nnkTypeDef
   let name = known.tsName(identName(typeDef[0]))
-  let generics = genericParams(typeDef[1])
+  let params = genericNames(typeDef[1])
+  let generics = if params.len == 0: "" else: "<" & params.join(", ") & ">"
+  var known = known
+  known.generics = params
 
   var rhs = typeDef[2]
   if rhs.kind == nnkRefTy and rhs[0].kind == nnkObjectTy:
@@ -276,7 +325,8 @@ proc rpcSignature*(procDef: NimNode): RpcSignature =
     error("nim2ts: put {.rpc.} on the proc's implementation", procDef)
   let formal = procDef[3]
   result.returnType = formal[0]
-  if result.returnType.kind in {nnkIdent, nnkSym} and result.returnType.strVal == "void":
+  if result.returnType.kind in {nnkIdent, nnkSym} and
+      canonical(result.returnType.strVal) == "void":
     result.returnType = newEmptyNode()
   var contexts = 0
   for def in formal[1..^1]:
@@ -295,7 +345,7 @@ proc rpcSignature*(procDef: NimNode): RpcSignature =
   if contexts > 1:
     error("nim2ts: an {.rpc.} proc takes at most one {.context.} parameter", formal)
 
-proc hasInput(sig: RpcSignature): bool =
+proc hasInput*(sig: RpcSignature): bool =
   sig.params.anyIt(not it.context)
 
 proc procedureToTs*(sig: RpcSignature, known = default(Known)): string =
@@ -305,7 +355,7 @@ proc procedureToTs*(sig: RpcSignature, known = default(Known)): string =
   for p in sig.params:
     if p.context:
       continue
-    if p.typ.kind == nnkBracketExpr and identName(p.typ[0]) == "Option":
+    if p.typ.kind == nnkBracketExpr and canonical(identName(p.typ[0])) == "Option":
       fields.add p.name & "?: " & toTsType(p.typ, known)
     else:
       fields.add p.name & ": " & toTsType(p.typ, known)
@@ -320,7 +370,7 @@ proc procedureToTs*(sig: RpcSignature, known = default(Known)): string =
 const rpcNames* = ["Procedures", "Transport", "createClient", "Client"]
   ## Declared by the generated client next to the user's types.
 
-proc clientToTs*(procedures: seq[RpcSignature], known = default(Known)): string =
+proc clientToTs*(procedures: seq[tuple[name, entry: string, hasInput: bool]]): string =
   ## The `Procedures` map, the `Transport` the app supplies and a client
   ## with one function per procedure.
   var calls: seq[string]
@@ -331,7 +381,7 @@ proc clientToTs*(procedures: seq[RpcSignature], known = default(Known)): string 
     else:
       calls.add "  " & p.name & ": () => transport(\"" & p.name & "\", {}),"
   result = "export type Procedures = {\n" &
-    procedures.mapIt("  " & procedureToTs(it, known)).join("\n") & "\n};\n\n" &
+    procedures.mapIt("  " & it.entry).join("\n") & "\n};\n\n" &
     "export type Transport = <P extends keyof Procedures>(\n" &
     "  procedure: P,\n" &
     "  input: Procedures[P][\"input\"],\n" &

@@ -5,7 +5,7 @@
 ## strict: it rejects anything the TypeScript type would not allow and
 ## anything that does not fit the Nim type (out of range, wrong length).
 
-import std/[json, macros, math, options, strutils, tables, typetraits]
+import std/[json, macros, math, options, sequtils, strutils, tables, typetraits]
 
 template omitNone*() {.pragma.}
   ## Field pragma for `Option[T]`: `none` leaves the key out instead of
@@ -41,6 +41,57 @@ proc describe(n: JsonNode): string =
 proc expect(n: JsonNode, kinds: set[JsonNodeKind], what, path: string) =
   if n.isNil or n.kind notin kinds:
     fail(path, "expected " & what & ", got " & describe(n))
+
+proc typeImpl(n: NimNode): NimNode =
+  ## The definition behind a type symbol, alias or generic instance.
+  case n.kind
+  of nnkSym: typeImpl(n.getImpl)
+  of nnkTypeDef: typeImpl(n[2])
+  of nnkBracketExpr: typeImpl(n[0])
+  else: n
+
+macro omitsNone(obj: typed, field: static string): bool =
+  ## Whether `field` of `obj`'s type carries `{.omitNone.}`. This is the walk
+  ## `hasCustomPragma` does, which stops at a generic base like
+  ## `object of Base[T]`; here the base's symbol is looked up instead.
+  var typ = getTypeInst(obj)
+  while typ.kind in {nnkVarTy, nnkBracketExpr}:
+    typ = typ[0]
+  var typeDef = getImpl(typ)
+  while typeDef != nil and typeDef.kind == nnkTypeDef:
+    var impl = typeImpl(typeDef[2])
+    if impl.kind in {nnkRefTy, nnkPtrTy}:
+      if impl[0].kind in {nnkSym, nnkBracketExpr}:
+        typeDef = getImpl(if impl[0].kind == nnkBracketExpr: impl[0][0] else: impl[0])
+        continue
+      impl = impl[0]
+    if impl.kind != nnkObjectTy:
+      break
+    var pending = toSeq(impl[2].children)
+    while pending.len > 0:
+      let node = pending.pop()
+      case node.kind
+      of nnkRecList:
+        pending.add toSeq(node.children)
+      of nnkRecCase:
+        for branch in node[1..^1]:
+          pending.add branch.last
+      of nnkIdentDefs:
+        for name in node[0 ..< ^2]:
+          if name.kind == nnkPragmaExpr and
+              eqIdent(if name[0].kind == nnkPostfix: name[0][1] else: name[0], field):
+            for pragma in name[1]:
+              if eqIdent(pragma, "omitNone"):
+                return newLit(true)
+            return newLit(false)
+      else:
+        discard
+    let base = impl[1]
+    typeDef =
+      if base.kind != nnkOfInherit: nil
+      elif base[0].kind == nnkBracketExpr: getImpl(base[0][0])
+      else: getImpl(base[0])
+  newLit(false)
 
 # Writing
 
@@ -90,7 +141,7 @@ proc toJson*[T: object](x: T): JsonNode =
   mixin toJson
   result = newJObject()
   for k, v in fieldPairs(x):
-    when v.hasCustomPragma(omitNone):
+    when omitsNone(x, k):
       when v isnot Option:
         {.error: "nim2ts: {.omitNone.} needs an Option field: " & k.}
       if v.isSome:
