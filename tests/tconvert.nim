@@ -19,7 +19,7 @@ static:
   doAssert toTsType(parseExpr("ref User")) == "User"
 
   # Whole declarations: parseStmt gives a type section, [0] is the nnkTypeDef.
-  proc decl(src: string): string = toTsDecl(parseStmt(src)[0][0]).code
+  proc decl(src: string): string = toTsDecl(parseStmt(src)[0][0])
 
   doAssert decl("type Id = distinct int") == "export type Id = number;"
   doAssert decl("type Role = enum admin, member") ==
@@ -34,12 +34,12 @@ static:
     "export type P = {\n  a?: number;\n  b: number | null;\n};"
 
 # Case objects need the wire values of their discriminator enum.
-const enums = {
+const known = Known(enums: {
   "Kind": @[("circle", "circle"), ("rect", "RECT"), ("dot", "dot")],
-}.toTable
+}.toTable)
 
 static:
-  proc variant(src: string): string = toTsDecl(parseStmt(src)[0][0], enums).code
+  proc variant(src: string): string = toTsDecl(parseStmt(src)[0][0], known)
 
   doAssert variant("""
 type S = object
@@ -82,7 +82,7 @@ type S[T] = object
 );"""
 
 macro convert(src: static string) =
-  discard toTsDecl(parseStmt(src)[0][0], enums)
+  discard toTsDecl(parseStmt(src)[0][0], known)
 
 static: doAssert compiles(convert("type S = object\n  case k: Kind\n  of circle: discard\n  else: discard"))
 # Unsupported shapes are compile errors.
@@ -116,10 +116,11 @@ static:
   doAssert entry("proc touch(ctx {.context.}: Ctx): void = discard") ==
     "touch: { input: Record<string, never>; output: null };"
 
-  doAssert clientToTs(@[("getUser", "getUser: E;", true), ("ping", "ping: E;", false)]) ==
+  proc sig(src: string): RpcSignature = rpcSignature(parseStmt(src)[0])
+  doAssert clientToTs(@[sig("proc getUser(id: int): User = discard"), sig("proc ping() = discard")]) ==
     """export type Procedures = {
-  getUser: E;
-  ping: E;
+  getUser: { input: { id: number }; output: User };
+  ping: { input: Record<string, never>; output: null };
 };
 
 export type Transport = <P extends keyof Procedures>(
@@ -144,3 +145,15 @@ static: doAssert not compiles(signature("proc f(a: var int) = discard"))
 static: doAssert not compiles(signature("proc f(a: int): int"))
 static: doAssert not compiles(signature("proc f(a {.context.}, b {.context.}: int) = discard"))
 static: doAssert not compiles(signature("func f(a: int): int = a"))
+
+# Renamed types: references use the TypeScript name, whatever their spelling.
+const renamed = Known(names: {"Record": "DbRecord", "Page": "Paged"}.toTable)
+
+static:
+  doAssert toTsType(parseExpr("seq[Record]"), renamed) == "DbRecord[]"
+  doAssert toTsType(parseExpr("Page[Record]"), renamed) == "Paged<DbRecord>"
+  doAssert toTsDecl(parseStmt("type Record* = object\n  id: int")[0][0], renamed) ==
+    "export type DbRecord = {\n  id: number;\n};"
+  doAssert procedureToTs(rpcSignature(parseStmt(
+    "proc get(id: int): Record = discard")[0]), renamed) ==
+    "get: { input: { id: number }; output: DbRecord };"

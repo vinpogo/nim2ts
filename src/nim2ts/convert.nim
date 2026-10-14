@@ -24,11 +24,24 @@ proc identName*(n: NimNode): string =
   else:
     error("nim2ts: expected a name, got " & $n.kind, n)
 
+type
+  EnumValues* = Table[string, seq[tuple[member, value: string]]]
+    ## Wire values per enum, in declaration order.
+
+  Known* = object
+    ## What the converter knows about other `{.ts.}` declarations, keyed by
+    ## `nimIdentNormalize` of the Nim type name.
+    enums*: EnumValues ## case objects label their branches with these
+    names*: Table[string, string] ## the TypeScript name of each type
+
+proc tsName*(known: Known, nimName: string): string =
+  known.names.getOrDefault(nimIdentNormalize(nimName), nimName)
+
 proc wrapUnion(tsType: string): string =
   ## `number | null` must become `(number | null)` before appending `[]`.
   if " | " in tsType: "(" & tsType & ")" else: tsType
 
-proc toTsType*(n: NimNode): string =
+proc toTsType*(n: NimNode, known = default(Known)): string =
   ## Maps a Nim type expression to a TypeScript type expression.
   ## This is the place to add new mappings.
   case n.kind
@@ -45,32 +58,29 @@ proc toTsType*(n: NimNode): string =
     of "JsonNode":
       result = "unknown"
     else:
-      # A custom type: emitted by name. It must also be annotated with
-      # `{.ts.}`, otherwise tsc will complain about an unknown type.
-      result = n.strVal
+      # A custom type: emitted by its TypeScript name. It must also be
+      # annotated with `{.ts.}`, otherwise tsc reports an unknown type.
+      result = known.tsName(n.strVal)
   of nnkBracketExpr:
     let head = identName(n[0])
     case head
     of "seq", "array":
       # `array[3, T]` carries the element type last.
-      result = wrapUnion(toTsType(n[^1])) & "[]"
+      result = wrapUnion(toTsType(n[^1], known)) & "[]"
     of "Option":
-      result = toTsType(n[1]) & " | null"
+      result = toTsType(n[1], known) & " | null"
     of "Table", "OrderedTable":
       if n[1].kind notin {nnkIdent, nnkSym} or n[1].strVal != "string":
         error("nim2ts: table keys must be strings, got " & n[1].repr, n)
-      result = "Record<string, " & toTsType(n[2]) & ">"
+      result = "Record<string, " & toTsType(n[2], known) & ">"
     else:
       # A generic custom type like `Page[User]` -> `Page<User>`.
-      result = head & "<" & n[1..^1].mapIt(toTsType(it)).join(", ") & ">"
+      result = known.tsName(head) & "<" &
+        n[1..^1].mapIt(toTsType(it, known)).join(", ") & ">"
   of nnkRefTy, nnkDistinctTy:
-    result = toTsType(n[0])
+    result = toTsType(n[0], known)
   else:
     error("nim2ts: unsupported type (" & $n.kind & "): " & n.repr, n)
-
-type EnumValues* = Table[string, seq[tuple[member, value: string]]]
-  ## Wire values of every `{.ts.}` enum seen so far, keyed by enum name,
-  ## in declaration order. Case objects need them to label their branches.
 
 proc enumMembers*(enumTy: NimNode): seq[tuple[member, value: string]] =
   ## The members of an `nnkEnumTy` and the strings `$` gives for them,
@@ -104,32 +114,32 @@ proc hasPragma(field: NimNode, name: string): bool =
       if p.kind in {nnkIdent, nnkSym} and p.strVal == name:
         return true
 
-proc fieldsToTs(def: NimNode): seq[string] =
+proc fieldsToTs(def: NimNode, known: Known): seq[string] =
   ## `a, b: int` is one nnkIdentDefs: (a, b, type, default value).
   let typ = def[^2]
   for field in def[0 ..< ^2]:
     if field.hasPragma("omitNone"):
       if typ.kind != nnkBracketExpr or identName(typ[0]) != "Option":
         error("nim2ts: {.omitNone.} needs an Option field: " & identName(field), field)
-      result.add identName(field) & "?: " & toTsType(typ[1])
+      result.add identName(field) & "?: " & toTsType(typ[1], known)
     else:
-      result.add identName(field) & ": " & toTsType(typ)
+      result.add identName(field) & ": " & toTsType(typ, known)
 
-proc branchFieldsToTs(body: NimNode): seq[string] =
+proc branchFieldsToTs(body: NimNode, known: Known): seq[string] =
   case body.kind
   of nnkNilLit:
     discard # `of x: discard`
   of nnkIdentDefs:
-    result = fieldsToTs(body)
+    result = fieldsToTs(body, known)
   of nnkRecList:
     for def in body:
-      result.add branchFieldsToTs(def)
+      result.add branchFieldsToTs(def, known)
   of nnkRecCase:
     error("nim2ts: nested case objects are not supported yet", body)
   else:
     error("nim2ts: unsupported object field (" & $body.kind & ")", body)
 
-proc caseToTs(recCase: NimNode, enums: EnumValues): string =
+proc caseToTs(recCase: NimNode, known: Known): string =
   ## One `case` section becomes a union with one member per branch, each
   ## carrying the discriminator and the fields `std/json` emits for it.
   let discriminator = recCase[0]
@@ -138,8 +148,8 @@ proc caseToTs(recCase: NimNode, enums: EnumValues): string =
   var values: seq[tuple[member, value: string]]
   if tagType == "bool":
     values = @[("false", "false"), ("true", "true")]
-  elif tagType in enums:
-    for (member, value) in enums[tagType]:
+  elif nimIdentNormalize(tagType) in known.enums:
+    for (member, value) in known.enums[nimIdentNormalize(tagType)]:
       values.add (member, "\"" & value & "\"")
   else:
     error("nim2ts: the discriminator '" & tag & "' must be a bool or an " &
@@ -172,18 +182,18 @@ proc caseToTs(recCase: NimNode, enums: EnumValues): string =
       error("nim2ts: unsupported case branch (" & $branch.kind & ")", branch)
     if labels.len == 0:
       continue
-    let fields = @[tag & ": " & labels.join(" | ")] & branchFieldsToTs(branch[^1])
+    let fields = @[tag & ": " & labels.join(" | ")] & branchFieldsToTs(branch[^1], known)
     branches.add "  | { " & fields.join("; ") & " }"
   result = "(\n" & branches.join("\n") & "\n)"
 
-proc objectToTs(name, generics: string, objTy: NimNode, enums: EnumValues): string =
+proc objectToTs(name, generics: string, objTy: NimNode, known: Known): string =
   ## `objTy` is an `nnkObjectTy`: (pragmas, inheritance, fields). The
   ## result is the intersection of its base, its shared fields and one
   ## union per `case` section.
   var base = ""
   let inherit = objTy[1]
   if inherit.kind == nnkOfInherit and identName(inherit[0]) != "RootObj":
-    base = toTsType(inherit[0])
+    base = toTsType(inherit[0], known)
 
   var fields: seq[string]
   var unions: seq[string]
@@ -192,9 +202,9 @@ proc objectToTs(name, generics: string, objTy: NimNode, enums: EnumValues): stri
     for def in recList:
       case def.kind
       of nnkIdentDefs:
-        fields.add fieldsToTs(def)
+        fields.add fieldsToTs(def, known)
       of nnkRecCase:
-        unions.add caseToTs(def, enums)
+        unions.add caseToTs(def, known)
       else:
         error("nim2ts: unsupported object field (" & $def.kind & ")", def)
 
@@ -223,13 +233,11 @@ proc genericParams(n: NimNode): string =
       names.add identName(param)
   result = "<" & names.join(", ") & ">"
 
-proc toTsDecl*(
-    typeDef: NimNode, enums = default(EnumValues)
-): tuple[name, code: string] =
+proc toTsDecl*(typeDef: NimNode, known = default(Known)): string =
   ## Turns one `nnkTypeDef` (name, generic params, definition) into a
-  ## complete TypeScript declaration. `enums` labels case object branches.
+  ## complete TypeScript declaration.
   typeDef.expectKind nnkTypeDef
-  let name = identName(typeDef[0])
+  let name = known.tsName(identName(typeDef[0]))
   let generics = genericParams(typeDef[1])
 
   var rhs = typeDef[2]
@@ -238,12 +246,12 @@ proc toTsDecl*(
 
   case rhs.kind
   of nnkObjectTy:
-    result = (name, objectToTs(name, generics, rhs, enums))
+    result = objectToTs(name, generics, rhs, known)
   of nnkEnumTy:
-    result = (name, enumToTs(name, rhs))
+    result = enumToTs(name, rhs)
   else:
     # Aliases (`Tags = seq[string]`) and distinct types (`UserId = distinct int`).
-    result = (name, "export type " & name & generics & " = " & toTsType(rhs) & ";")
+    result = "export type " & name & generics & " = " & toTsType(rhs, known) & ";"
 
 type
   RpcParam* = object
@@ -287,7 +295,10 @@ proc rpcSignature*(procDef: NimNode): RpcSignature =
   if contexts > 1:
     error("nim2ts: an {.rpc.} proc takes at most one {.context.} parameter", formal)
 
-proc procedureToTs*(sig: RpcSignature): string =
+proc hasInput(sig: RpcSignature): bool =
+  sig.params.anyIt(not it.context)
+
+proc procedureToTs*(sig: RpcSignature, known = default(Known)): string =
   ## One entry of the `Procedures` map. `Option` parameters may be left
   ## out, since reading accepts a missing key as `none`.
   var fields: seq[string]
@@ -295,21 +306,21 @@ proc procedureToTs*(sig: RpcSignature): string =
     if p.context:
       continue
     if p.typ.kind == nnkBracketExpr and identName(p.typ[0]) == "Option":
-      fields.add p.name & "?: " & toTsType(p.typ)
+      fields.add p.name & "?: " & toTsType(p.typ, known)
     else:
-      fields.add p.name & ": " & toTsType(p.typ)
+      fields.add p.name & ": " & toTsType(p.typ, known)
   let input =
     if fields.len == 0: "Record<string, never>"
     else: "{ " & fields.join("; ") & " }"
   let output =
     if sig.returnType.kind == nnkEmpty: "null"
-    else: toTsType(sig.returnType)
+    else: toTsType(sig.returnType, known)
   result = sig.name & ": { input: " & input & "; output: " & output & " };"
 
 const rpcNames* = ["Procedures", "Transport", "createClient", "Client"]
   ## Declared by the generated client next to the user's types.
 
-proc clientToTs*(procedures: seq[tuple[name, entry: string, hasInput: bool]]): string =
+proc clientToTs*(procedures: seq[RpcSignature], known = default(Known)): string =
   ## The `Procedures` map, the `Transport` the app supplies and a client
   ## with one function per procedure.
   var calls: seq[string]
@@ -320,7 +331,7 @@ proc clientToTs*(procedures: seq[tuple[name, entry: string, hasInput: bool]]): s
     else:
       calls.add "  " & p.name & ": () => transport(\"" & p.name & "\", {}),"
   result = "export type Procedures = {\n" &
-    procedures.mapIt("  " & it.entry).join("\n") & "\n};\n\n" &
+    procedures.mapIt("  " & procedureToTs(it, known)).join("\n") & "\n};\n\n" &
     "export type Transport = <P extends keyof Procedures>(\n" &
     "  procedure: P,\n" &
     "  input: Procedures[P][\"input\"],\n" &
