@@ -30,3 +30,13 @@ export interface Page<T> {
 }
 
 export type UserPage = Page<User>;
+
+export type ShapeKind = "circle" | "RECT" | "dot";
+
+export type Shape = {
+  name: string;
+} & (
+  | { kind: "circle"; radius: number }
+  | { kind: "RECT"; width: number; height: number }
+  | { kind: "dot" }
+);

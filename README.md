@@ -65,11 +65,49 @@ switch("define", "nim2tsOut=" & thisDir() & "/../frontend/src/api/types.ts")
 | `object` / `ref object`                        | `interface`         |
 | `object of Base`                               | `interface … extends Base` |
 | `enum`                                         | union of string literals (uses explicit string values if given) |
+| case object (`case kind: K`)                   | discriminated union (see below) |
 | `Foo[T]` (generic)                             | `Foo<T>`            |
 | any other name                                 | the same name       |
 
 **Rule:** any custom type you reference must also be annotated with `{.ts.}`.
 If you forget one, `tsc` on the frontend reports the unknown name.
+
+### Case objects
+
+A case object becomes the intersection of its shared fields and one union per
+`case` section. Each union member carries the discriminator and exactly the
+fields `std/json` emits for that branch:
+
+```nim
+type
+  ShapeKind* {.ts.} = enum
+    circle, rect = "RECT", dot
+
+  Shape* {.ts.} = object
+    name*: string
+    case kind*: ShapeKind
+    of circle:
+      radius*: float
+    of rect:
+      width*, height*: float
+    else:
+      discard
+```
+
+```ts
+export type Shape = {
+  name: string;
+} & (
+  | { kind: "circle"; radius: number }
+  | { kind: "RECT"; width: number; height: number }
+  | { kind: "dot" }
+);
+```
+
+The discriminator must be a `bool` or an enum annotated with `{.ts.}` and
+declared before the case object, so its wire values are known. Branch labels
+must be plain members (no ranges), and nested `case` sections are not
+supported yet.
 
 ## How it works
 
@@ -78,17 +116,16 @@ If you forget one, `tsc` on the frontend reports the unknown name.
   unchanged type).
 - `src/nim2ts/convert.nim` turns that AST into TypeScript text. It works on
   syntax only, so it maps type *names*. `toTsType` is where new mappings go.
-- `src/nim2ts.nim` keeps a compile-time list of all declarations and rewrites
-  the whole output file on every `{.ts.}`. The last one leaves the complete
-  file behind. Under `nim check` and nimsuggest, `writeFile` is a no-op, so
+- `src/nim2ts.nim` keeps a compile-time list of all declarations and the wire
+  values of every annotated enum (case object branches need them). It
+  rewrites the whole output file on every `{.ts.}`; the last one leaves the
+  complete file behind. Under `nim check` and nimsuggest, `writeFile` is a no-op, so
   your editor won't touch the file.
 
 To see the AST of any Nim snippet, wrap it in `dumpTree:` from `std/macros`.
 
 ## Limitations / ideas for next steps
 
-- Case objects (object variants) are rejected; they could become
-  discriminated unions.
 - Fields can't be renamed; a `{.tsName: "..."}` field pragma would fix that.
 - `Option[T]` becomes `field: T | null`; a `-d:nim2tsOptional` switch could
   emit `field?: T` instead.
