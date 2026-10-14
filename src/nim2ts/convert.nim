@@ -6,7 +6,7 @@
 ## Tip: to see what AST a piece of Nim code produces, run
 ## `dumpTree: <your code>` from `std/macros`.
 
-import std/[macros, sequtils, strutils]
+import std/[macros, sequtils, strutils, tables]
 
 proc identName*(n: NimNode): string =
   ## Returns the plain name of a type or field, stripping the export marker
@@ -66,52 +66,138 @@ proc toTsType*(n: NimNode): string =
   else:
     error("nim2ts: unsupported type (" & $n.kind & "): " & n.repr, n)
 
-proc objectToTs(name, generics: string, objTy: NimNode): string =
-  ## `objTy` is an `nnkObjectTy`: (pragmas, inheritance, fields).
-  result = "export interface " & name & generics
+type EnumValues* = Table[string, seq[tuple[member, value: string]]]
+  ## Wire values of every `{.ts.}` enum seen so far, keyed by enum name,
+  ## in declaration order. Case objects need them to label their branches.
 
+proc enumMembers*(enumTy: NimNode): seq[tuple[member, value: string]] =
+  ## The members of an `nnkEnumTy` and the strings `$` gives for them,
+  ## which is how `std/json` and jsony serialize enums.
+  for field in enumTy[1..^1]: # enumTy[0] is always empty
+    if field.kind == nnkEnumFieldDef:
+      let member = identName(field[0])
+      let explicit = field[1]
+      case explicit.kind
+      of nnkStrLit..nnkTripleStrLit:
+        result.add (member, explicit.strVal) # `active = "ACTIVE"`
+      of nnkTupleConstr, nnkPar:
+        result.add (member, explicit[1].strVal) # `active = (1, "ACTIVE")`
+      else:
+        result.add (member, member) # `active = 1`: `$` still gives the name
+    else:
+      let member = identName(field)
+      result.add (member, member)
+
+proc fieldsToTs(def: NimNode): seq[string] =
+  ## `a, b: int` is one nnkIdentDefs: (a, b, type, default value).
+  let tsType = toTsType(def[^2])
+  for field in def[0 ..< ^2]:
+    result.add identName(field) & ": " & tsType
+
+proc branchFieldsToTs(body: NimNode): seq[string] =
+  case body.kind
+  of nnkNilLit:
+    discard # `of x: discard`
+  of nnkIdentDefs:
+    result = fieldsToTs(body)
+  of nnkRecList:
+    for def in body:
+      result.add branchFieldsToTs(def)
+  of nnkRecCase:
+    error("nim2ts: nested case objects are not supported yet", body)
+  else:
+    error("nim2ts: unsupported object field (" & $body.kind & ")", body)
+
+proc caseToTs(recCase: NimNode, enums: EnumValues): string =
+  ## One `case` section becomes a union with one member per branch, each
+  ## carrying the discriminator and the fields `std/json` emits for it.
+  let discriminator = recCase[0]
+  let tag = identName(discriminator[0])
+  let tagType = identName(discriminator[1])
+  var values: seq[tuple[member, value: string]]
+  if tagType == "bool":
+    values = @[("false", "false"), ("true", "true")]
+  elif tagType in enums:
+    for (member, value) in enums[tagType]:
+      values.add (member, "\"" & value & "\"")
+  else:
+    error("nim2ts: the discriminator '" & tag & "' must be a bool or an " &
+      "enum annotated with {.ts.} and declared before this type", discriminator)
+
+  proc valueOf(label: NimNode): string =
+    let member = identName(label)
+    for v in values:
+      if v.member == member:
+        return v.value
+    error("nim2ts: '" & member & "' is not a member of " & tagType, label)
+
+  var covered: seq[string]
+  var branches: seq[string]
+  for branch in recCase[1..^1]:
+    var labels: seq[string]
+    case branch.kind
+    of nnkOfBranch:
+      for label in branch[0 ..< ^1]:
+        if label.kind notin {nnkIdent, nnkSym}:
+          error("nim2ts: only plain branch labels are supported, got " &
+            label.repr, label)
+        labels.add valueOf(label)
+      covered.add labels
+    of nnkElse:
+      for v in values:
+        if v.value notin covered:
+          labels.add v.value
+    else:
+      error("nim2ts: unsupported case branch (" & $branch.kind & ")", branch)
+    if labels.len == 0:
+      continue
+    let fields = @[tag & ": " & labels.join(" | ")] & branchFieldsToTs(branch[^1])
+    branches.add "  | { " & fields.join("; ") & " }"
+  result = "(\n" & branches.join("\n") & "\n)"
+
+proc objectToTs(name, generics: string, objTy: NimNode, enums: EnumValues): string =
+  ## `objTy` is an `nnkObjectTy`: (pragmas, inheritance, fields). A plain
+  ## object becomes an interface; one with `case` sections an intersection
+  ## of its shared fields and one union per section.
+  var base = ""
   let inherit = objTy[1]
   if inherit.kind == nnkOfInherit and identName(inherit[0]) != "RootObj":
-    result.add " extends " & toTsType(inherit[0])
+    base = toTsType(inherit[0])
 
   var fields: seq[string]
+  var unions: seq[string]
   let recList = objTy[2]
   if recList.kind == nnkRecList:
     for def in recList:
       case def.kind
       of nnkIdentDefs:
-        # `a, b: int` is one nnkIdentDefs: (a, b, type, default value).
-        let tsType = toTsType(def[^2])
-        for field in def[0 ..< ^2]:
-          fields.add "  " & identName(field) & ": " & tsType & ";"
+        fields.add fieldsToTs(def)
       of nnkRecCase:
-        error("nim2ts: case objects are not supported yet", def)
+        unions.add caseToTs(def, enums)
       else:
         error("nim2ts: unsupported object field (" & $def.kind & ")", def)
 
-  if fields.len == 0:
-    result.add " {}"
+  let body =
+    if fields.len == 0: "{}"
+    else: "{\n" & fields.mapIt("  " & it & ";").join("\n") & "\n}"
+
+  if unions.len == 0:
+    result = "export interface " & name & generics
+    if base.len > 0:
+      result.add " extends " & base
+    result.add " " & body
   else:
-    result.add " {\n" & fields.join("\n") & "\n}"
+    var parts: seq[string]
+    if base.len > 0:
+      parts.add base
+    if fields.len > 0:
+      parts.add body
+    parts.add unions
+    result = "export type " & name & generics & " = " & parts.join(" & ") & ";"
 
 proc enumToTs(name: string, enumTy: NimNode): string =
-  ## Enums become a union of string literals, which is how `std/json` and
-  ## jsony serialize them (via `$`).
-  var members: seq[string]
-  for field in enumTy[1..^1]: # enumTy[0] is always empty
-    var value: string
-    if field.kind == nnkEnumFieldDef:
-      let explicit = field[1]
-      case explicit.kind
-      of nnkStrLit..nnkTripleStrLit:
-        value = explicit.strVal # `active = "ACTIVE"`
-      of nnkTupleConstr, nnkPar:
-        value = explicit[1].strVal # `active = (1, "ACTIVE")`
-      else:
-        value = identName(field[0]) # `active = 1`: `$` still gives the name
-    else:
-      value = identName(field)
-    members.add "\"" & value & "\""
+  ## Enums become a union of string literals.
+  let members = enumMembers(enumTy).mapIt("\"" & it.value & "\"")
   result = "export type " & name & " = " & members.join(" | ") & ";"
 
 proc genericParams(n: NimNode): string =
@@ -124,9 +210,11 @@ proc genericParams(n: NimNode): string =
       names.add identName(param)
   result = "<" & names.join(", ") & ">"
 
-proc toTsDecl*(typeDef: NimNode): tuple[name, code: string] =
+proc toTsDecl*(
+    typeDef: NimNode, enums = default(EnumValues)
+): tuple[name, code: string] =
   ## Turns one `nnkTypeDef` (name, generic params, definition) into a
-  ## complete TypeScript declaration.
+  ## complete TypeScript declaration. `enums` labels case object branches.
   typeDef.expectKind nnkTypeDef
   let name = identName(typeDef[0])
   let generics = genericParams(typeDef[1])
@@ -137,7 +225,7 @@ proc toTsDecl*(typeDef: NimNode): tuple[name, code: string] =
 
   case rhs.kind
   of nnkObjectTy:
-    result = (name, objectToTs(name, generics, rhs))
+    result = (name, objectToTs(name, generics, rhs, enums))
   of nnkEnumTy:
     result = (name, enumToTs(name, rhs))
   else:
