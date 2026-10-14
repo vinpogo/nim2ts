@@ -1,7 +1,8 @@
 # nim2ts
 
-Generate TypeScript type definitions from Nim types, so a Nim backend and a
-TypeScript frontend share one source of truth for their API contracts.
+Generate TypeScript type definitions from Nim types, and serialize those
+types to JSON exactly as declared, so a Nim backend and a TypeScript frontend
+share one source of truth for their API contracts.
 
 ## Usage
 
@@ -54,14 +55,15 @@ switch("define", "nim2tsOut=" & thisDir() & "/../frontend/src/api/types.ts")
 
 | Nim                                            | TypeScript          |
 | ---------------------------------------------- | ------------------- |
-| `string`, `char`, `cstring`                    | `string`            |
+| `string`, `char`                               | `string`            |
 | `int*`, `uint*`, `float*`, `Natural`, `Positive` | `number`          |
 | `bool`                                         | `boolean`           |
 | `JsonNode`                                     | `unknown`           |
 | `seq[T]`, `array[N, T]`                        | `T[]`               |
 | `Option[T]`                                    | `T \| null`         |
-| `Table[K, V]`, `OrderedTable[K, V]`            | `Record<K, V>`      |
-| `ref T`, `ptr T`, `distinct T`                 | `T`                 |
+| `Option[T]` field with `{.omitNone.}`          | optional field `?: T` |
+| `Table[string, V]`, `OrderedTable[string, V]`  | `Record<string, V>` |
+| `ref T`, `distinct T`                          | `T`                 |
 | `object` / `ref object`                        | `interface`         |
 | `object of Base`                               | `interface … extends Base` |
 | `enum`                                         | union of string literals (uses explicit string values if given) |
@@ -109,11 +111,39 @@ declared before the case object, so its wire values are known. Branch labels
 must be plain members (no ranges), and nested `case` sections are not
 supported yet.
 
+## JSON
+
+`toJson` and `fromJson` (re-exported by `nim2ts`, using only `std/json`)
+read the same declarations as the generator, so the JSON always has the shape
+of the generated TypeScript:
+
+```nim
+let user = fromJson(parseJson(body), User) # raises WireError on bad input
+echo toJson(user)
+```
+
+- Keys are the Nim field names; there is no renaming.
+- A case object writes its discriminator and the fields of the active branch.
+- `Option[T]` writes `null` for `none`. Mark the field `{.omitNone.}` to leave
+  the key out instead; TypeScript then gets `field?: T`. Reading accepts a
+  missing key or `null` as `none` either way.
+- A `nil` ref cannot be written, since its TypeScript type has no `null`; use
+  `Option` for values that may be missing.
+- `fromJson` is strict: missing keys, wrong JSON kinds, unknown enum values,
+  integers out of range (`Natural`, `uint8`, …), arrays of the wrong length
+  and strings that are not one `char` raise `WireError`. Its `path` names the
+  offending value, as `$.items[2].name`. Unknown keys are ignored.
+
+`std/json`'s own `%` and `to` are not a substitute: `%` cannot write `char`
+or distinct types, and `to` silently wraps or pads values that do not fit.
+
 ## How it works
 
 - `type X {.ts.} = ...` is a *type macro pragma*: Nim calls the `ts` macro
   with the untyped `nnkTypeDef` AST and uses whatever it returns (here, the
   unchanged type).
+- `src/nim2ts/wire.nim` is the JSON side: generic procs that walk the typed
+  values with `fieldPairs` and read `{.omitNone.}` with `hasCustomPragma`.
 - `src/nim2ts/convert.nim` turns that AST into TypeScript text. It works on
   syntax only, so it maps type *names*. `toTsType` is where new mappings go.
 - `src/nim2ts.nim` keeps a compile-time list of all declarations and the wire
@@ -124,12 +154,6 @@ supported yet.
 
 To see the AST of any Nim snippet, wrap it in `dumpTree:` from `std/macros`.
 
-## Limitations / ideas for next steps
-
-- Fields can't be renamed; a `{.tsName: "..."}` field pragma would fix that.
-- `Option[T]` becomes `field: T | null`; a `-d:nim2tsOptional` switch could
-  emit `field?: T` instead.
-
 ## Tests
 
 ```sh
@@ -137,4 +161,5 @@ nimble test
 ```
 
 `tests/tconvert.nim` unit-tests the mapping at compile time;
-`tests/tgenerate.nim` compares the generated file to `tests/expected.ts`.
+`tests/tgenerate.nim` compares the generated file to `tests/expected.ts` and
+round-trips its types through JSON; `tests/twire.nim` tests the JSON rules.

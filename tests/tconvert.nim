@@ -27,6 +27,8 @@ static:
   doAssert decl("type Empty = object") == "export interface Empty {}"
   doAssert decl("type P = object\n  x, y: float") ==
     "export interface P {\n  x: number;\n  y: number;\n}"
+  doAssert decl("type P = object\n  a* {.omitNone.}, b: Option[int]") ==
+    "export interface P {\n  a?: number;\n  b: number | null;\n}"
 
 # Case objects need the wire values of their discriminator enum.
 const enums = {
@@ -81,6 +83,9 @@ macro convert(src: static string) =
 
 doAssert compiles(convert("type S = object\n  case k: Kind\n  of circle: discard\n  else: discard"))
 # Unsupported shapes are compile errors.
+doAssert not compiles(convert("type S = object\n  a {.omitNone.}: int"))
+doAssert not compiles(convert("type S = object\n  t: Table[int, string]"))
+doAssert not compiles(convert("type S = object\n  p: ptr int"))
 doAssert not compiles(convert("type S = object\n  case k: Unknown\n  of a: discard"))
 doAssert not compiles(convert("type S = object\n  case k: int\n  of 1: discard"))
 doAssert not compiles(convert("type S = object\n  case k: Kind\n  of square: discard"))
