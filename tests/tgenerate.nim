@@ -49,6 +49,16 @@ type
     else:
       discard
 
+  LabeledShape* {.ts.} = ref object of RootObj
+    case kind*: ShapeKind
+    of circle:
+      radius*: float
+    else:
+      discard
+
+  Label* {.ts.} = ref object of LabeledShape
+    text*: string
+
 test "generated file matches snapshot":
   let dir = currentSourcePath.parentDir
   check readFile(dir / "generated.ts") == readFile(dir / "expected.ts")
@@ -59,6 +69,10 @@ test "toJson writes the keys of the matching union member":
   check keys(Shape(name: "r", kind: rect)) == @["name", "kind", "width", "height"]
   check keys(Shape(name: "d", kind: dot)) == @["name", "kind"]
   check toJson(Shape(kind: rect))["kind"].getStr == "RECT"
+
+test "a child of a case object writes its parent's branch":
+  check toSeq(toJson(Label(kind: circle, radius: 1, text: "t")).keys) ==
+    @["text", "kind", "radius"]
 
 test "round trip through the generated types":
   let user = User(id: UserId(1), name: "n", email: "e", roles: @[admin],

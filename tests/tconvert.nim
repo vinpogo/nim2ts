@@ -24,11 +24,14 @@ static:
   doAssert decl("type Id = distinct int") == "export type Id = number;"
   doAssert decl("type Role = enum admin, member") ==
     "export type Role = \"admin\" | \"member\";"
-  doAssert decl("type Empty = object") == "export interface Empty {}"
+  doAssert decl("type Empty = object") == "export type Empty = {};"
   doAssert decl("type P = object\n  x, y: float") ==
-    "export interface P {\n  x: number;\n  y: number;\n}"
+    "export type P = {\n  x: number;\n  y: number;\n};"
+  doAssert decl("type C = object of Base\n  x: int") ==
+    "export type C = Base & {\n  x: number;\n};"
+  doAssert decl("type C = ref object of Base") == "export type C = Base;"
   doAssert decl("type P = object\n  a* {.omitNone.}, b: Option[int]") ==
-    "export interface P {\n  a?: number;\n  b: number | null;\n}"
+    "export type P = {\n  a?: number;\n  b: number | null;\n};"
 
 # Case objects need the wire values of their discriminator enum.
 const enums = {
@@ -83,6 +86,7 @@ macro convert(src: static string) =
 
 doAssert compiles(convert("type S = object\n  case k: Kind\n  of circle: discard\n  else: discard"))
 # Unsupported shapes are compile errors.
+doAssert not compiles(convert("type E = enum a = \"same\", b = \"same\""))
 doAssert not compiles(convert("type S = object\n  a {.omitNone.}: int"))
 doAssert not compiles(convert("type S = object\n  t: Table[int, string]"))
 doAssert not compiles(convert("type S = object\n  p: ptr int"))

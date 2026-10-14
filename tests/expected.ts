@@ -8,11 +8,11 @@ export type UserId = number;
 
 export type Tags = string[];
 
-export interface Entity {
+export type Entity = {
   id: UserId;
-}
+};
 
-export interface User extends Entity {
+export type User = Entity & {
   name: string;
   email: string;
   nickname: string | null;
@@ -23,12 +23,12 @@ export interface User extends Entity {
   type: string;
   scores: Record<string, number>;
   history: (number | null)[];
-}
+};
 
-export interface Page<T> {
+export type Page<T> = {
   items: T[];
   total: number;
-}
+};
 
 export type UserPage = Page<User>;
 
@@ -41,3 +41,12 @@ export type Shape = {
   | { kind: "RECT"; width: number; height: number }
   | { kind: "dot" }
 );
+
+export type LabeledShape = (
+  | { kind: "circle"; radius: number }
+  | { kind: "RECT" | "dot" }
+);
+
+export type Label = LabeledShape & {
+  text: string;
+};
