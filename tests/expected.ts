@@ -50,3 +50,24 @@ export type LabeledShape = (
 export type Label = LabeledShape & {
   text: string;
 };
+
+export type Procedures = {
+  findUser: { input: { id: UserId }; output: User };
+  listUsers: { input: { role?: Role | null }; output: UserPage };
+  area: { input: { shape: Shape }; output: number };
+  ping: { input: Record<string, never>; output: null };
+};
+
+export type Transport = <P extends keyof Procedures>(
+  procedure: P,
+  input: Procedures[P]["input"],
+) => Promise<Procedures[P]["output"]>;
+
+export const createClient = (transport: Transport) => ({
+  findUser: (input: Procedures["findUser"]["input"]) => transport("findUser", input),
+  listUsers: (input: Procedures["listUsers"]["input"]) => transport("listUsers", input),
+  area: (input: Procedures["area"]["input"]) => transport("area", input),
+  ping: () => transport("ping", {}),
+});
+
+export type Client = ReturnType<typeof createClient>;

@@ -244,3 +244,87 @@ proc toTsDecl*(
   else:
     # Aliases (`Tags = seq[string]`) and distinct types (`UserId = distinct int`).
     result = (name, "export type " & name & generics & " = " & toTsType(rhs) & ";")
+
+type
+  RpcParam* = object
+    name*: string
+    typ*: NimNode
+    context*: bool ## `{.context.}`: passed by `dispatch`, not on the wire
+
+  RpcSignature* = object
+    name*: string
+    params*: seq[RpcParam]
+    returnType*: NimNode ## `nnkEmpty` for a proc without a result
+
+proc rpcSignature*(procDef: NimNode): RpcSignature =
+  ## Validates an `{.rpc.}` proc and extracts what both the TypeScript
+  ## client and the dispatcher need.
+  if procDef.kind != nnkProcDef:
+    error("nim2ts: {.rpc.} goes on a proc", procDef)
+  result.name = identName(procDef[0])
+  if procDef[2].kind != nnkEmpty:
+    error("nim2ts: an {.rpc.} proc cannot be generic", procDef[2])
+  if procDef[6].kind == nnkEmpty:
+    error("nim2ts: put {.rpc.} on the proc's implementation", procDef)
+  let formal = procDef[3]
+  result.returnType = formal[0]
+  if result.returnType.kind in {nnkIdent, nnkSym} and result.returnType.strVal == "void":
+    result.returnType = newEmptyNode()
+  var contexts = 0
+  for def in formal[1..^1]:
+    let typ = def[^2]
+    if typ.kind == nnkEmpty:
+      error("nim2ts: {.rpc.} parameters need an explicit type", def)
+    if def[^1].kind != nnkEmpty:
+      error("nim2ts: {.rpc.} parameters cannot have defaults; use Option[T]", def)
+    if typ.kind == nnkVarTy:
+      error("nim2ts: {.rpc.} parameters cannot be var", def)
+    for param in def[0 ..< ^2]:
+      let context = param.hasPragma("context")
+      if context:
+        inc contexts
+      result.params.add RpcParam(name: identName(param), typ: typ, context: context)
+  if contexts > 1:
+    error("nim2ts: an {.rpc.} proc takes at most one {.context.} parameter", formal)
+
+proc procedureToTs*(sig: RpcSignature): string =
+  ## One entry of the `Procedures` map. `Option` parameters may be left
+  ## out, since reading accepts a missing key as `none`.
+  var fields: seq[string]
+  for p in sig.params:
+    if p.context:
+      continue
+    if p.typ.kind == nnkBracketExpr and identName(p.typ[0]) == "Option":
+      fields.add p.name & "?: " & toTsType(p.typ)
+    else:
+      fields.add p.name & ": " & toTsType(p.typ)
+  let input =
+    if fields.len == 0: "Record<string, never>"
+    else: "{ " & fields.join("; ") & " }"
+  let output =
+    if sig.returnType.kind == nnkEmpty: "null"
+    else: toTsType(sig.returnType)
+  result = sig.name & ": { input: " & input & "; output: " & output & " };"
+
+const rpcNames* = ["Procedures", "Transport", "createClient", "Client"]
+  ## Declared by the generated client next to the user's types.
+
+proc clientToTs*(procedures: seq[tuple[name, entry: string, hasInput: bool]]): string =
+  ## The `Procedures` map, the `Transport` the app supplies and a client
+  ## with one function per procedure.
+  var calls: seq[string]
+  for p in procedures:
+    if p.hasInput:
+      calls.add "  " & p.name & ": (input: Procedures[\"" & p.name &
+        "\"][\"input\"]) => transport(\"" & p.name & "\", input),"
+    else:
+      calls.add "  " & p.name & ": () => transport(\"" & p.name & "\", {}),"
+  result = "export type Procedures = {\n" &
+    procedures.mapIt("  " & it.entry).join("\n") & "\n};\n\n" &
+    "export type Transport = <P extends keyof Procedures>(\n" &
+    "  procedure: P,\n" &
+    "  input: Procedures[P][\"input\"],\n" &
+    ") => Promise<Procedures[P][\"output\"]>;\n\n" &
+    "export const createClient = (transport: Transport) => ({\n" &
+    calls.join("\n") & "\n});\n\n" &
+    "export type Client = ReturnType<typeof createClient>;"
