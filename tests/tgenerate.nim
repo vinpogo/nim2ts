@@ -59,6 +59,33 @@ type
   Label* {.ts.} = ref object of LabeledShape
     text*: string
 
+type
+  Directory = ref object
+    users: seq[User]
+
+  NotFound = object of CatchableError
+
+proc findUser*(dir {.context.}: Directory, id: UserId): User {.rpc.} =
+  for u in dir.users:
+    if u.id.int == id.int:
+      return u
+  raise newException(NotFound, "no user " & $id.int)
+
+proc listUsers*(dir {.context.}: Directory, role: Option[Role]): UserPage {.rpc.} =
+  for u in dir.users:
+    if role.isNone or role.get in u.roles:
+      result.items.add u
+  result.total = result.items.len
+
+proc area*(shape: Shape): float {.rpc.} =
+  case shape.kind
+  of circle: 3.0 * shape.radius * shape.radius
+  of rect: shape.width * shape.height
+  of dot: 0
+
+proc ping*() {.rpc.} =
+  discard
+
 test "generated file matches snapshot":
   let dir = currentSourcePath.parentDir
   check readFile(dir / "generated.ts") == readFile(dir / "expected.ts")
@@ -81,3 +108,31 @@ test "round trip through the generated types":
   let page = UserPage(items: @[user], total: 1)
   check toJson(fromJson(toJson(page), UserPage)) == toJson(page)
   check "bio" notin toJson(user)
+
+let dir = Directory(users: @[
+  User(id: UserId(1), name: "ann", email: "a@x", roles: @[admin], status: active),
+  User(id: UserId(2), name: "bob", email: "b@x", roles: @[member], status: banned),
+])
+
+test "dispatch reads parameters, passes the context and writes the result":
+  check dispatch("findUser", %*{"id": 2}, dir)["name"].getStr == "bob"
+  check dispatch("listUsers", %*{"role": "admin"}, dir)["total"].getInt == 1
+  check dispatch("listUsers", %*{}, dir)["total"].getInt == 2
+  check dispatch("area", %*{"shape": {"name": "r", "kind": "RECT", "width": 2, "height": 3}}, dir).getFloat == 6
+  check dispatch("ping", %*{}, dir).kind == JNull
+
+test "dispatch rejects unknown procedures and invalid input":
+  expect UnknownProcedure:
+    discard dispatch("dropUsers", %*{}, dir)
+  try:
+    discard dispatch("findUser", %*{"id": "2"}, dir)
+    fail()
+  except WireError as e:
+    check e.path == "$.id"
+
+test "errors raised by a procedure pass through":
+  expect NotFound:
+    discard dispatch("findUser", %*{"id": 3}, dir)
+
+test "dispatch needs a context when a procedure takes one":
+  check not compiles(dispatch("ping", %*{}))

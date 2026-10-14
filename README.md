@@ -1,8 +1,12 @@
 # nim2ts
 
-Generate TypeScript type definitions from Nim types, and serialize those
-types to JSON exactly as declared, so a Nim backend and a TypeScript frontend
-share one source of truth for their API contracts.
+Generate TypeScript type definitions and a typed RPC client from Nim
+declarations, and serialize those types to JSON exactly as declared, so a Nim
+backend and a TypeScript frontend share one source of truth for their API
+contracts.
+
+nim2ts does not depend on an HTTP server or a TypeScript HTTP or query
+library: the app connects the two sides with a few lines of its own.
 
 ## Usage
 
@@ -139,6 +143,80 @@ echo toJson(user)
 `std/json`'s own `%` and `to` are not a substitute: `%` cannot write `char`
 or distinct types, and `to` silently wraps or pads values that do not fit.
 
+## RPC
+
+Annotate procs with `{.rpc.}`:
+
+```nim
+type Db = ref object # yours; not on the wire
+
+proc getUser*(db {.context.}: Db, id: UserId): User {.rpc.} =
+  db.find(id)
+
+proc listUsers*(db {.context.}: Db, role: Option[Role]): seq[User] {.rpc.} =
+  db.list(role)
+```
+
+The generated file gains:
+
+```ts
+export type Procedures = {
+  getUser: { input: { id: UserId }; output: User };
+  listUsers: { input: { role?: Role | null }; output: User[] };
+};
+
+export type Transport = <P extends keyof Procedures>(
+  procedure: P,
+  input: Procedures[P]["input"],
+) => Promise<Procedures[P]["output"]>;
+
+export const createClient = (transport: Transport) => ({ … });
+
+export type Client = ReturnType<typeof createClient>;
+```
+
+A call is a procedure name and a JSON object holding its parameters; the
+answer is the JSON of its result (`null` for a proc without one). How that
+travels is the app's choice. On the server, `dispatch` makes the call:
+
+```nim
+# e.g. in a handler for POST /rpc/<procedure>
+let output = dispatch(procedure, parseJson(request.body), db)
+```
+
+and in the browser, a `Transport` sends it:
+
+```ts
+const client = createClient(async (procedure, input) => {
+  const response = await fetch(`/rpc/${procedure}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
+  });
+  if (!response.ok) throw new Error(await response.text());
+  return response.json();
+});
+
+const user = await client.getUser({ id: 1 }); // typed as User
+```
+
+- Parameters are read with `fromJson`, results written with `toJson`, so
+  every JSON rule above applies. `Option` parameters may be left out.
+- A `{.context.}` parameter is not on the wire: it receives the value passed
+  as `dispatch`'s third argument, such as a database handle or the current
+  user. A proc takes at most one; `dispatch` without a context does not
+  compile while any proc needs one.
+- `dispatch` raises `WireError` for invalid input and `UnknownProcedure` for
+  an unknown name. Whatever the proc raises passes through, so the app decides
+  how errors look on the wire, and can declare that shape with `{.ts.}`.
+- `dispatch` expands to a `case` over the procs registered so far in the
+  compilation, so their modules must be imported where it is called. An
+  `{.rpc.}` proc that comes later is a compile error.
+- Procedure names are unique across the program, generic procs and `var`
+  parameters are not supported, and parameters cannot have defaults (use
+  `Option[T]`). With any `{.rpc.}` proc, the names `Procedures`, `Transport`,
+  `createClient` and `Client` are taken in the generated file.
+
 ## How it works
 
 - `type X {.ts.} = ...` is a *type macro pragma*: Nim calls the `ts` macro
@@ -148,11 +226,14 @@ or distinct types, and `to` silently wraps or pads values that do not fit.
   values with `fieldPairs` and read `{.omitNone.}` with `hasCustomPragma`.
 - `src/nim2ts/convert.nim` turns that AST into TypeScript text. It works on
   syntax only, so it maps type *names*. `toTsType` is where new mappings go.
-- `src/nim2ts.nim` keeps a compile-time list of all declarations and the wire
-  values of every annotated enum (case object branches need them). It
-  rewrites the whole output file on every `{.ts.}`; the last one leaves the
-  complete file behind. Under `nim check` and nimsuggest, `writeFile` is a no-op, so
-  your editor won't touch the file.
+- `src/nim2ts.nim` keeps compile-time lists of all declarations, the wire
+  values of every annotated enum (case object branches need them) and the
+  `{.rpc.}` procs. It rewrites the whole output file on every `{.ts.}` and
+  `{.rpc.}`; the last one leaves the complete file behind. Under `nim check`
+  and nimsuggest, `writeFile` is a no-op, so your editor won't touch the file.
+- `proc foo(...) {.rpc.}` is a proc macro pragma. It keeps the proc and adds
+  an exported `nim2tsCallFoo` wrapper that reads the parameters into a
+  hidden object type and writes the result; `dispatch` calls the wrappers.
 
 To see the AST of any Nim snippet, wrap it in `dumpTree:` from `std/macros`.
 
@@ -163,5 +244,7 @@ nimble test
 ```
 
 `tests/tconvert.nim` unit-tests the mapping at compile time;
-`tests/tgenerate.nim` compares the generated file to `tests/expected.ts` and
-round-trips its types through JSON; `tests/twire.nim` tests the JSON rules.
+`tests/tgenerate.nim` compares the generated file to `tests/expected.ts`,
+round-trips its types through JSON and calls its procs through `dispatch`;
+`tests/twire.nim` tests the JSON rules; `tests/tcompile.nim` checks the
+compile errors in `tests/fixtures/`.

@@ -84,17 +84,17 @@ type S[T] = object
 macro convert(src: static string) =
   discard toTsDecl(parseStmt(src)[0][0], enums)
 
-doAssert compiles(convert("type S = object\n  case k: Kind\n  of circle: discard\n  else: discard"))
+static: doAssert compiles(convert("type S = object\n  case k: Kind\n  of circle: discard\n  else: discard"))
 # Unsupported shapes are compile errors.
-doAssert not compiles(convert("type E = enum a = \"same\", b = \"same\""))
-doAssert not compiles(convert("type S = object\n  a {.omitNone.}: int"))
-doAssert not compiles(convert("type S = object\n  t: Table[int, string]"))
-doAssert not compiles(convert("type S = object\n  p: ptr int"))
-doAssert not compiles(convert("type S = object\n  case k: Unknown\n  of a: discard"))
-doAssert not compiles(convert("type S = object\n  case k: int\n  of 1: discard"))
-doAssert not compiles(convert("type S = object\n  case k: Kind\n  of square: discard"))
-doAssert not compiles(convert("type S = object\n  case k: Kind\n  of circle..rect: discard"))
-doAssert not compiles(convert("""
+static: doAssert not compiles(convert("type E = enum a = \"same\", b = \"same\""))
+static: doAssert not compiles(convert("type S = object\n  a {.omitNone.}: int"))
+static: doAssert not compiles(convert("type S = object\n  t: Table[int, string]"))
+static: doAssert not compiles(convert("type S = object\n  p: ptr int"))
+static: doAssert not compiles(convert("type S = object\n  case k: Unknown\n  of a: discard"))
+static: doAssert not compiles(convert("type S = object\n  case k: int\n  of 1: discard"))
+static: doAssert not compiles(convert("type S = object\n  case k: Kind\n  of square: discard"))
+static: doAssert not compiles(convert("type S = object\n  case k: Kind\n  of circle..rect: discard"))
+static: doAssert not compiles(convert("""
 type S = object
   case k: Kind
   of circle:
@@ -102,3 +102,45 @@ type S = object
     of true: discard
     of false: discard
   else: discard"""))
+
+# RPC procedures
+static:
+  proc entry(src: string): string = procedureToTs(rpcSignature(parseStmt(src)[0]))
+
+  doAssert entry("proc getUser*(id: UserId): User = discard") ==
+    "getUser: { input: { id: UserId }; output: User };"
+  doAssert entry("proc find(ctx {.context.}: Ctx, q: string, limit: Option[int]): seq[User] = discard") ==
+    "find: { input: { q: string; limit?: number | null }; output: User[] };"
+  doAssert entry("proc ping() = discard") ==
+    "ping: { input: Record<string, never>; output: null };"
+  doAssert entry("proc touch(ctx {.context.}: Ctx): void = discard") ==
+    "touch: { input: Record<string, never>; output: null };"
+
+  doAssert clientToTs(@[("getUser", "getUser: E;", true), ("ping", "ping: E;", false)]) ==
+    """export type Procedures = {
+  getUser: E;
+  ping: E;
+};
+
+export type Transport = <P extends keyof Procedures>(
+  procedure: P,
+  input: Procedures[P]["input"],
+) => Promise<Procedures[P]["output"]>;
+
+export const createClient = (transport: Transport) => ({
+  getUser: (input: Procedures["getUser"]["input"]) => transport("getUser", input),
+  ping: () => transport("ping", {}),
+});
+
+export type Client = ReturnType<typeof createClient>;"""
+
+macro signature(src: static string) =
+  discard rpcSignature(parseStmt(src)[0])
+
+static: doAssert compiles(signature("proc f(a: int): int = a"))
+static: doAssert not compiles(signature("proc f[T](a: T): T = a"))
+static: doAssert not compiles(signature("proc f(a = 1): int = a"))
+static: doAssert not compiles(signature("proc f(a: var int) = discard"))
+static: doAssert not compiles(signature("proc f(a: int): int"))
+static: doAssert not compiles(signature("proc f(a {.context.}, b {.context.}: int) = discard"))
+static: doAssert not compiles(signature("func f(a: int): int = a"))
