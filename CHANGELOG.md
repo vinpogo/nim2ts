@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.1.2] - 2026-10-15
+
+### Commits
+- fix: allow disabling TypeScript output generation
+
 ## [0.1.1] - 2026-10-15
 
 ### Commits
