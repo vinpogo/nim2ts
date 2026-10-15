@@ -93,7 +93,16 @@ macro omitsNone(obj: typed, field: static string): bool =
       else: getImpl(base[0])
   newLit(false)
 
-# Writing
+# Writing. As with reading below, the generic writers are declared up
+# front: the module instantiating them need not import nim2ts, so `mixin`
+# may find nothing more in its scope.
+
+proc toJson*[T](x: Option[T]): JsonNode
+proc toJson*[T](x: openArray[T]): JsonNode
+proc toJson*[V](x: Table[string, V] | OrderedTable[string, V]): JsonNode
+proc toJson*[T: distinct](x: T): JsonNode
+proc toJson*[T: object](x: T): JsonNode
+proc toJson*[T: ref](x: T): JsonNode
 
 proc toJson*(x: string): JsonNode = newJString(x)
 proc toJson*(x: char): JsonNode = newJString($x)
@@ -129,7 +138,7 @@ proc toJson*[T](x: openArray[T]): JsonNode =
 proc toJson*[V](x: Table[string, V] | OrderedTable[string, V]): JsonNode =
   mixin toJson
   result = newJObject()
-  for k, v in x:
+  for k, v in x.pairs:
     result[k] = toJson(v)
 
 proc toJson*[T: distinct](x: T): JsonNode =
@@ -159,7 +168,7 @@ proc toJson*[T: ref](x: T): JsonNode =
 
 # Reading. The generic readers are declared up front so they find each
 # other whatever the nesting: they are private, so `mixin` cannot reach
-# them from the caller's scope.
+# them from the caller's scope either.
 
 proc readJson[T](dst: var Option[T], n: JsonNode, path: string)
 proc readJson[T](dst: var seq[T], n: JsonNode, path: string)
@@ -249,7 +258,7 @@ proc readJson[V](
 ) =
   mixin readJson
   expect(n, {JObject}, "an object", path)
-  for k, item in n.fields:
+  for k, item in n.fields.pairs:
     var v: V
     readJson(v, item, path & "[" & escapeJson(k) & "]")
     dst[k] = v

@@ -35,6 +35,18 @@ test "dispatch reaches procs its caller does not import, and keeps foo apart fro
   check code == 0
   check output.strip.splitLines == @["\"user 7\"", "\"foo\"", "\"Foo\"", "\"hidden\""]
 
+test "toJson and fromJson reach every overload for a caller that does not import nim2ts":
+  let (output, code) = compiler("r", "indirect_codec.nim")
+  checkpoint output
+  check code == 0
+  let item = """{"name":"a"}"""
+  check output.strip.splitLines == @[
+    """{"items":[""" & item & """],"maybe":""" & item & ""","byName":{"b":""" & item &
+      """},"ordered":{"c":""" & item & """},"pair":[""" & item & "," & item &
+      """],"nodes":[{"item":""" & item & """}],"wrapped":[""" & item &
+      """],"kind":"tagged","tags":[""" & item & """,null]}""",
+    "true", "[" & item & "]", item, item]
+
 test "an {.rpc.} proc declared after dispatch":
   check "comes after a dispatch call" in checkError("late_rpc.nim")
 
