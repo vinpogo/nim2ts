@@ -55,6 +55,19 @@ or in `config.nims`:
 switch("define", "nim2tsOut=" & thisDir() & "/../frontend/src/api/types.ts")
 ```
 
+An empty value, `-d:nim2tsOut=`, writes nothing: useful for test binaries
+that compile only some of the types and would otherwise overwrite the file
+with them. Compile errors about the declarations are still reported. With
+the snippet below, any entry point other than the app's own writes nothing.
+
+```nim
+# config.nims: only the app's own build writes the file
+when projectName() == "server":
+  switch("define", "nim2tsOut=" & thisDir() & "/../frontend/src/api/types.ts")
+else:
+  switch("define", "nim2tsOut=")
+```
+
 ## Type mapping
 
 | Nim                                            | TypeScript          |

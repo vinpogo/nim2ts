@@ -5,17 +5,21 @@ import std/[os, osproc, strutils, unittest]
 
 let dir = currentSourcePath.parentDir
 
-proc compiler(command, fixture: string): tuple[output: string, exitCode: int] =
+proc compiler(command, file, output: string, workingDir = ""): tuple[output: string,
+    exitCode: int] =
+  ## Runs `nim <command>` on `file` with nim2ts on the path, writing the
+  ## TypeScript to `output`.
   execCmdEx(getCurrentCompilerExe() & " " & command & " --hints:off --path:" &
-    quoteShell(dir / ".." / "src") & " -d:nim2tsOut=" & quoteShell(getTempDir() / "nim2ts-fixture.ts") &
-    " " & quoteShell(dir / "fixtures" / fixture))
+    quoteShell(dir / ".." / "src") & " -d:nim2tsOut=" & quoteShell(output) & " " &
+    quoteShell(file), workingDir = workingDir)
+
+proc compiler(command, fixture: string): tuple[output: string, exitCode: int] =
+  compiler(command, dir / "fixtures" / fixture, getTempDir() / "nim2ts-fixture.ts")
 
 proc generate(fixture: string): string =
   ## The TypeScript a fixture generates, or its compile error.
   let output = getTempDir() / "nim2ts-" & fixture.changeFileExt(".ts")
-  let (log, code) = execCmdEx(getCurrentCompilerExe() & " c --compileOnly --hints:off --path:" &
-    quoteShell(dir / ".." / "src") & " -d:nim2tsOut=" & quoteShell(output) & " " &
-    quoteShell(dir / "fixtures" / fixture))
+  let (log, code) = compiler("c --compileOnly", dir / "fixtures" / fixture, output)
   if code != 0:
     return log
   readFile(output)
@@ -64,3 +68,20 @@ test "a parameter that hides a type renamed after it":
 
 test "a plain type may take a container's name":
   check "tables: DbTable[];" in generate("container_name.nim")
+
+test "an empty output path writes nothing":
+  # Outside tests/, so tests/config.nims cannot supply an output path: a
+  # regression would write the default types.ts into the scratch directory.
+  let scratch = getTempDir() / "nim2ts-no-output"
+  removeDir(scratch)
+  createDir(scratch)
+  copyFile(dir / "fixtures" / "container_name.nim", scratch / "fixture.nim")
+  let (log, code) = compiler("c --compileOnly", scratch / "fixture.nim", "", scratch)
+  checkpoint log
+  check code == 0
+  var written: seq[string]
+  for file in walkDirRec(scratch):
+    if file.endsWith(".ts"):
+      written.add file
+  check written.len == 0
+  removeDir(scratch)
