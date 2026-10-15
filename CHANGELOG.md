@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.1.3] - 2026-10-15
+
+### Commits
+- fix(codec): resolve generic writers for indirect callers
+
 ## [0.1.2] - 2026-10-15
 
 ### Commits
